@@ -1,0 +1,6 @@
+# generated at import by scene.py (absolute mesh paths, machine-specific)
+assets/
+# regenerable from seeds with collect.py
+demos/
+*.mp4
+__pycache__/
