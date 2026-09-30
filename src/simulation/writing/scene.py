@@ -110,15 +110,23 @@ def _ensure_assets() -> str:
     urdf = out / "panda_pen.urdf"
     txt = _pen_urdf()
     if not urdf.exists() or urdf.read_text() != txt:
-        urdf.write_text(txt)
+        _write_atomic(urdf, txt)
     srdf_src = pathlib.Path(PACKAGE_ASSET_DIR) / "robots" / "panda" / "panda_stick.srdf"
     srdf = out / "panda_pen.srdf"
     s = srdf_src.read_text().replace(
         "</robot>", '    <disable_collisions link1="panda_hand" link2="pen" reason="Adjacent"/>\n'
                     '    <disable_collisions link1="panda_link7" link2="pen" reason="Adjacent"/>\n</robot>')
     if not srdf.exists() or srdf.read_text() != s:
-        srdf.write_text(s)
+        _write_atomic(srdf, s)
     return str(urdf)
+
+
+def _write_atomic(path: pathlib.Path, text: str) -> None:
+    """Many worker processes import this module at once; none may read a
+    half-written robot description."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
 
 
 @register_agent()

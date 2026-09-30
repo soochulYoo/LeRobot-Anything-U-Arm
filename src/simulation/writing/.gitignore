@@ -4,3 +4,5 @@ assets/
 demos/
 *.mp4
 __pycache__/
+policy/runs/
+logs/

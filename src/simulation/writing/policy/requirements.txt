@@ -1,0 +1,10 @@
+# On top of the ManiSkill venv (sapien, mani_skill, gymnasium, torch, h5py, numpy).
+# Versions are the ones this code was written and tested against.
+jax[cuda12]==0.9.1
+flax==0.12.5
+optax==0.2.6
+h5py
+scipy
+matplotlib
+imageio
+transforms3d

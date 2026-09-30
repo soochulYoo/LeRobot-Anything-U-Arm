@@ -31,6 +31,7 @@ builds one, with delayed vision and delayed touch.
 | `evaluate.py` | `WritingPolicyEnv` (policy-rate env), replay and scripted reference policies, pluggable learned policy |
 | `interactive.py` | collect demos yourself: keyboard force teleop in the viewer, live K_p keys, recording (see below) |
 | `protocol.py` | the pen writes by itself, you set stiffness in three levels by a fixed protocol (see below) |
+| `policy/` | force-aware flow policies (CoFA a–d) whose action includes stiffness; training and Slurm scripts, see `policy/README.md` |
 | `plot_episode.py` | one recorded episode on one page: ink vs. target, force, K_p, camera frames |
 | `tests.py` | 30 checks: `python3 tests.py` (~20 s) |
 
