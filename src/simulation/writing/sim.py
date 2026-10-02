@@ -74,7 +74,16 @@ class TaskSpec:
 
     @staticmethod
     def sample(seed: int, vocab: list[str] | None = None, max_len: int = 3,
-               dz: float = 0.004, tilt_deg: float = 5.0) -> "TaskSpec":
+               dz: float = 0.004, tilt_deg: float = 5.0,
+               mu: tuple = (0.2, 0.5)) -> "TaskSpec":
+        """`mu` is the paper's friction range, and it is the one hidden variable
+        a camera cannot see: measured out of fold, vision explains R^2 = -0.20 and
+        0.00 of the two TANGENTIAL force axes against 0.87 of the normal one
+        (policy/SPRING.md).  The default (0.2, 0.5) is narrow enough that a single
+        xy stiffness covers all of it, which is why protocol.py fixes xy at LOW
+        and why every structure's `acc xy` sits at 98% with nothing to learn.
+        Widening it is what gives the stiffness a job -- see protocol.py --mu.
+        """
         rng = np.random.default_rng(seed)
         if vocab is None:
             chars = [c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"]
@@ -97,7 +106,7 @@ class TaskSpec:
             canvas_dz=float(rng.uniform(-dz, dz)),
             tilt_x=float(np.deg2rad(rng.uniform(-tilt_deg, tilt_deg))),
             tilt_y=float(np.deg2rad(rng.uniform(-tilt_deg, tilt_deg))),
-            friction=float(rng.uniform(0.2, 0.5)),
+            friction=float(rng.uniform(*mu)),
             seed=seed)
 
 
@@ -117,22 +126,37 @@ class Criteria:
 
 
 class WritingSim:
+    # The tool, so ../wiping can be this simulator with an eraser on the wrist.
+    ENV_ID = "TeleopWriting-v1"
+    TOOL_LINK = "pen"
+
+    @staticmethod
+    def tool_urdf() -> str:
+        return S.PandaPen.urdf_path
+
     def __init__(self, image_size: int = 128, wrist_camera: bool = True,
                  cameras: bool = True, gains: C.Case1Gains | None = None,
-                 criteria: Criteria | None = None, render_mode: str | None = None):
+                 criteria: Criteria | None = None, render_mode: str | None = None,
+                 sim_freq: int | None = None):
+        # sim_freq overrides scene.py's 500 Hz.  speedup.py needs it: the
+        # time-scaling symmetry is a CONTINUOUS-time identity, and the discrete
+        # loop is conjugate step for step only when a c-times faster execution
+        # also steps c times faster, so one step covers the same phase.
         self.cameras = cameras
-        self.env = gym.make("TeleopWriting-v1", num_envs=1, sim_backend="cpu",
+        extra = {} if sim_freq is None else dict(
+            sim_config=dict(sim_freq=int(sim_freq), control_freq=int(sim_freq)))
+        self.env = gym.make(self.ENV_ID, num_envs=1, sim_backend="cpu",
                             obs_mode="rgb" if cameras else "state",
                             render_mode=render_mode,
-                            image_size=image_size, wrist_camera=wrist_camera)
+                            image_size=image_size, wrist_camera=wrist_camera, **extra)
         self.env.reset(seed=0)
         self.u = self.env.unwrapped
         self.dt = 1.0 / self.u.sim_freq
         self.crit = criteria or Criteria()
         self.robot = self.u.agent.robot
-        self.ctl = C.Case1Controller(self.robot, gains or C.Case1Gains(), S.PandaPen.urdf_path)
+        self.ctl = C.Case1Controller(self.robot, gains or C.Case1Gains(), self.tool_urdf())
         links = self.robot.get_links()
-        self.pen = sapien_utils.get_obj_by_name(links, "pen")
+        self.pen = sapien_utils.get_obj_by_name(links, self.TOOL_LINK)
         self.others = [sapien_utils.get_obj_by_name(links, n)
                        for n in ("panda_hand", "panda_link7", "panda_link6", "panda_link5")]
         # What the operator and any policy BELIEVE: the nominal, untilted paper.
@@ -181,6 +205,7 @@ class WritingSim:
         self._last_ink = None
         self.pen_down_steps = 0
         self.in_band_steps = 0
+        self.f_down_sum = 0.0
         self.peak = 0.0
         self.torn = False
         self.collided = False
@@ -192,6 +217,24 @@ class WritingSim:
                          x_d_next=self.ctl.x_d.copy(), K_next=self.ctl.K.copy())
         self.robot.set_qf(torch.zeros((1, len(q))))
         return self.observe()
+
+    # ---- what the tool is and what it does to the board -----------------
+    # Two hooks, so wiping (../wiping) can be the same simulator with a
+    # different tool rather than a copy of it that drifts.
+    def contact_point(self, rec, n):
+        """Where the tool touches: the ball's centre pushed one radius down."""
+        return rec["p"] - S.PEN_BALL_R * rec["R"][:, 2] - S.PEN_BALL_R * n
+
+    def on_contact(self, f_n, uvh, down) -> None:
+        """Writing lays ink along the contact path; wiping takes it off."""
+        if not down:
+            self._last_ink = None
+            return
+        uv = uvh[:2]
+        if self._last_ink is None or np.linalg.norm(uv - self._last_ink) >= self.crit.ink_spacing:
+            if self.u.put_ink(len(self.ink_uv), uv):
+                self.ink_uv.append(uv.copy())
+            self._last_ink = uv
 
     # ------------------------------------------------------------------ #
     def step(self, prop: C.Case1Proposal) -> dict:
@@ -218,24 +261,15 @@ class WritingSim:
         self.f_slow += b * (float(f_raw @ n) - self.f_slow)
         f_n = self.f_slow                       # the pressure: what writes and tears
 
-        # contact point: the ball's centre pushed one radius toward the paper
-        R_tip, p_tip = rec["R"], rec["p"]
-        ball = p_tip - S.PEN_BALL_R * R_tip[:, 2]
-        cp = ball - S.PEN_BALL_R * n
-        uvh = self.frame.to_canvas(cp)
+        uvh = self.frame.to_canvas(self.contact_point(rec, n))
 
         down = f_n >= cr.ink_force
         if down:
             self.pen_down_steps += 1
+            self.f_down_sum += f_n
             lo, hi = cr.force_band
             self.in_band_steps += int(lo <= f_n <= hi)
-            uv = uvh[:2]
-            if self._last_ink is None or np.linalg.norm(uv - self._last_ink) >= cr.ink_spacing:
-                if self.u.put_ink(len(self.ink_uv), uv):
-                    self.ink_uv.append(uv.copy())
-                self._last_ink = uv
-        else:
-            self._last_ink = None
+        self.on_contact(f_n, uvh, down)
         self.peak = max(self.peak, f_n)
         self.peak_fast = max(self.peak_fast, f_sensor_n)
         self.torn |= f_n > cr.tear_force
@@ -318,6 +352,7 @@ class WritingSim:
         in_band = self.in_band_steps / max(1, self.pen_down_steps)
         res = dict(coverage=coverage, precision=precision, chamfer_mm=1000 * chamfer,
                    in_band=float(in_band), peak_force=float(self.peak),
+                   contact_force=float(self.f_down_sum / max(1, self.pen_down_steps)),
                    peak_force_fast=float(self.peak_fast),
                    pen_down_s=self.pen_down_steps * self.dt,
                    torn=bool(self.torn), collided=bool(self.collided),

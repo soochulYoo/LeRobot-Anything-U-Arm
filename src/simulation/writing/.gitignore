@@ -5,4 +5,7 @@ demos/
 *.mp4
 __pycache__/
 policy/runs/
+policy/runs_*/
 logs/
+# 40 MB of ImageNet weights, rebuilt by policy/convert_resnet18.py
+policy/resnet18_imagenet.npz

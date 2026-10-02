@@ -33,11 +33,42 @@ What changes on the arm:
     hover height by 5 mm and landed on the paper at travel speed.  D is dissipative whatever it is, so this costs
     the tank nothing.  Its feed-forward D V_d is NOT dissipative, so it rides
     in Case 1's active slot u, where the gate scales it and the tank pays.
+  * THE ROTATIONAL DAMPING FOLLOWS THE SAME RULE, and for a while it did not.
+    Dr was built from a GUESSED scalar inertia, which makes the real damping
+    ratio zeta sqrt(I_guess / Lambda_rot) rather than zeta: against the
+    measured [0.005, 0.18, 0.38] kg m^2 at the tip, the guess 0.01 put it at
+    0.13-0.19 on two of three axes, a Q of about 4.  Nothing showed on a single
+    smooth traverse, which is why it survived; on a wiping raster, which
+    REVERSES every second, it rang the rotational mode hard enough to lose the
+    task -- 0% of the glyph erased at K_R = 1 against 66% once the inertia was
+    measured (../wiping/CURVED_BOARD.md).  Dr is now the matrix
+    zeta (Lambda_r^1/2 K_R^1/2 + K_R^1/2 Lambda_r^1/2), with Lambda_r the
+    rotational block of the same operational-space inertia, in the BODY frame
+    because that is the frame the damping acts in.
+  * K_R IS PART OF THE PROPOSAL, like K_p.  The rotational potential is
+    tr(K_R (I - R_d^T R)), so a stiffness rate U_r injects
+    U_r tr(I - R_d^T R) = U_r 2(1 - cos theta) of power -- nonnegative when
+    stiffening, exactly as 1/2 p_de^T U_p p_de is -- and it is metered into
+    p_prop and gated by the same alpha.  It is a 3x3 in the TOOL BODY frame,
+    so "comply in tilt, resist twist" is expressible; a scalar still works and
+    is what the writing task and the wiping protocol pass.
+  * WHAT K_R IS NOT: the stiffness the tool feels.  The elastic moment is
+    1/2 vee(K_R R_d^T R - R^T R_d K_R), whose small-angle gradient is
+    1/2 (tr(K_R) I - K_R) -- so the felt stiffness about an axis is half the
+    sum of the OTHER TWO K_R entries and does not depend on that axis's own
+    entry at all.  K_R = diag(50, 5, 50) is soft about y as a parameter and the
+    stiffest axis as a measurement.  felt_from_KR / KR_from_felt convert, and a
+    human-impedance label or a perturbation experiment measures the FELT one, so
+    that is the side a policy should predict.  Isotropic K_R hides this
+    completely (K_eff = kr I), which is why the writing task never saw it.
   * The compliance centre is the pen TIP (panda_hand_tcp sits at the ball's
     lowest point), so a rotational error pivots the pen about the point that
     writes instead of dragging the tip sideways.
   * Torque saturation at the Panda's joint limits is the delta_tau of the
     theorem: modelled, clipped and logged, never dropped.
+  * A proposal may carry an active JOINT torque u_tau.  Nothing in the writing
+    task uses it; the retiming clock correction of speedup.py does, and it is
+    gated, metered and clipped exactly like the task-space active term.
 
 WHAT IS LOGGED, per the recording spec case1.py follows: the REQUESTED values
 (x_d_req, K_req), the ADMITTED gate alpha, and the APPLIED values (x_d, K).
@@ -79,6 +110,63 @@ def k_world(k_diag: Array, W: Array) -> Array:
     return (W * np.asarray(k_diag, dtype=float)) @ W.T
 
 
+# --------------------------------------------------------------------------- #
+# K_R IS NOT THE STIFFNESS THE TOOL FEELS.
+#
+# The elastic moment below is  e_R = 1/2 vee(K_R R_d^T R - R^T R_d K_R).  Put
+# R_d^T R = I + s_hat for a small body rotation s and use
+# (K s_hat + s_hat K)^vee = (tr(K) I - K) s:
+#
+#     e_R  ->  1/2 (tr(K_R) I - K_R) s  =:  K_eff s
+#
+# so the stiffness an operator, a perturbation experiment or a human-impedance
+# label measures is K_eff, and the i-th diagonal entry of K_eff is
+# 1/2 (sum of the OTHER TWO entries of K_R) -- it does not depend on K_R[i, i]
+# at all.  Learning K_R from a felt label is therefore learning the wrong
+# quantity, and on an anisotropic profile it inverts the ordering:
+# K_R = diag(50, 5, 50) is soft about y as a parameter and the STIFFEST axis as
+# a measurement (K_eff = diag(27.5, 50, 27.5)).
+#
+# A scalar K_R hides all of it: K_R = kr I gives K_eff = kr I exactly, which is
+# why nothing in the writing task ever noticed.
+def as_KR(value) -> Array:
+    """A scalar, a 3-vector or a 3x3 -> the 3x3 K_R (or K_R rate) it means."""
+    a = np.asarray(value, dtype=float)
+    if a.ndim == 0:
+        return float(a) * np.eye(3)
+    if a.ndim == 1:
+        return np.diag(a)
+    return 0.5 * (a + a.T)
+
+
+def felt_from_KR(Kr: Array) -> Array:
+    """The rotational stiffness the tool actually feels, from the GIC gain."""
+    Kr = as_KR(Kr)
+    return 0.5 * (np.trace(Kr) * np.eye(3) - Kr)
+
+
+def KR_from_felt(K_eff: Array) -> Array:
+    """The GIC gain that yields a given felt stiffness: tr(K_eff) I - 2 K_eff.
+
+    Inverse of felt_from_KR, exactly (tr(K_eff) = tr(K_R) for the pair).  The
+    result is NOT positive definite for every positive-definite K_eff: with
+    K_eff = diag(a, b, c) it needs b + c > a on every axis, so no felt axis may
+    be stiffer than the other two together.  "Resist twist, comply in tilt" --
+    felt (5, 5, 50) -- wants K_R = diag(50, 50, -40) and is unreachable.  The
+    potential stays positive there, but GIC's and GUFIC's passivity proofs
+    assume K_R > 0 and `advance` clips the eigenvalues at `kr_lo`, so the
+    request is rejected rather than silently approximated.  `felt_reachable`
+    is the test to run BEFORE asking for a profile.
+    """
+    K_eff = as_KR(K_eff)
+    return np.trace(K_eff) * np.eye(3) - 2.0 * K_eff
+
+
+def felt_reachable(K_eff: Array, kr_lo: float = 0.0) -> bool:
+    """Is `K_eff` realizable by a K_R whose eigenvalues all clear `kr_lo`?"""
+    return bool(np.linalg.eigvalsh(KR_from_felt(K_eff)).min() >= kr_lo)
+
+
 @dataclass
 class Case1Gains:
     # Applied-stiffness bounds (Eq. 11's  k I <= K <= kbar I).  The gate scales
@@ -86,10 +174,19 @@ class Case1Gains:
     # time; the bound is a hypothesis of the theorem, not a safety extra.
     k_lo: float = 100.0
     k_hi: float = 4000.0
+    kr_lo: float = 0.1            # the same bound for the rotational stiffness
+    kr_hi: float = 100.0
     zeta: float = 0.8
     lambda_every: int = 5         # physics steps between inertia updates
-    Kr: float = 80.0              # Nm/rad, pen orientation (fixed)
-    wrist_inertia: float = 0.01   # kg m^2, for Dr = 2 zeta sqrt(I Kr) -- NOT sqrt(Kr)
+    # Nm/rad, the INITIAL rotational stiffness: a scalar (isotropic, the only
+    # thing the writing task needs) or a 3-vector / 3x3 in the TOOL BODY frame.
+    # It is the GIC GAIN K_R, not the felt stiffness -- see felt_from_KR above,
+    # and pass KR_from_felt(K_eff) to command a felt profile.
+    Kr: float | Array = 80.0
+    # None: Dr is built from the MEASURED rotational inertia, which is what it
+    # should always have been.  A number restores the old guessed scalar and is
+    # kept only so the difference stays reproducible -- see the docstring.
+    wrist_inertia: float | None = None
     null_kp: float = 5.0
     null_kd: float = 1.0
     # ---- energy tank (Eq. 11) ----
@@ -103,12 +200,26 @@ class Case1Gains:
 class Case1Proposal:
     """What the operator (or a policy) REQUESTS, before the gate.
 
-    The active wrench u is not part of the request: the only active term this
-    task needs is the damping feed-forward, which the controller derives from
-    V_d (see compute()).  A policy's whole action is therefore (x_d, K).
+    No task-space active wrench is part of the request: the only active term
+    this task needs is the damping feed-forward, which the controller derives
+    from V_d (see compute()).  A policy's whole action is therefore (x_d, K).
+
+    `u_tau` is the one exception, and it is a JOINT-space torque because the
+    only thing that asks for it is a joint-space quantity: the retiming clock
+    correction u_clock = (rdot/r) M v of the time-scaling theory, which cancels
+    the -(r'/r) M p defect a nonuniform execution clock leaves behind
+    (speedup.py).  It is active, not passive -- while the clock accelerates it
+    SUPPLIES power -- so it goes in Case 1's gated slot and its power qdot . u
+    is metered into p_prop like any other active term, and it is clipped at the
+    torque limit with everything else.  Leaving it out of the accounting would
+    put an unmetered energy source inside a controller whose whole point is
+    that there is none.
     """
     Vd: Array                     # reference velocity proposal, world, m/s
     Up: Array | None = None       # stiffness-rate proposal, world 3x3, N/m/s
+    Ur: float | Array | None = None   # rotational stiffness rate, Nm/rad/s;
+                                  # scalar (isotropic) or 3-vector / 3x3, body
+    u_tau: Array | None = None    # active joint torque proposal, N m
 
 
 class Case1Controller:
@@ -138,14 +249,27 @@ class Case1Controller:
         for j in self.robot.active_joints:
             j.set_drive_properties(0.0, 0.0, force_limit=1000.0)
 
-    def reset_state(self, x_d: Array, R_d: Array, K: Array, q_rest: Array | None = None) -> None:
+    def reset_state(self, x_d: Array, R_d: Array, K: Array, q_rest: Array | None = None,
+                    kr: float | None = None) -> None:
         self.x_d = np.asarray(x_d, dtype=float).copy()
         self.R_d = np.asarray(R_d, dtype=float).copy()
         self.K = np.asarray(K, dtype=float).copy()
+        self.Kr = as_KR(self.g.Kr if kr is None else kr)
         self.E = float(self.g.E0)
         self._Lam = None
         self._k = 0
         self.q_rest = self.q_mid.copy() if q_rest is None else np.asarray(q_rest, float).copy()
+
+    # The scalar view, for every caller that has one level of rotational
+    # stiffness to set (the wiping protocol, the tests): exact when K_R is
+    # isotropic, which is the only case any of them uses.
+    @property
+    def kr(self) -> float:
+        return float(np.trace(self.Kr) / 3.0)
+
+    @kr.setter
+    def kr(self, value) -> None:
+        self.Kr = as_KR(value)
 
     def tip_state(self) -> tuple[Array, Array, Array, Array]:
         """(R, p, v_world, w_world) of the pen tip."""
@@ -161,14 +285,28 @@ class Case1Controller:
     def inertia(self, q: Array, R: Array, J_b: Array) -> Array:
         """Translational block of the 6-D operational-space inertia at the tip.
         The 6-D block, not the 3-D one: the pen's orientation is held by Kr, so
-        the tip does not get the 3-D value's free-rotation discount."""
+        the tip does not get the 3-D value's free-rotation discount.
+
+        The ROTATIONAL block falls out of the same inverse and is kept for Dr,
+        rotated into the BODY frame: the rotational damping acts on V_b[3:],
+        and Lambda_world = blkdiag(R, R) Lambda_body blkdiag(R, R)^T.
+        """
         if self._k % max(1, self.g.lambda_every) == 0 or self._Lam is None:
             M = self.pm.compute_generalized_mass_matrix(q)
             Jw = np.vstack([R @ J_b[:3], R @ J_b[3:]])
             L6 = np.linalg.inv(Jw @ np.linalg.solve(M, Jw.T))
             self._Lam = 0.5 * (L6[:3, :3] + L6[:3, :3].T)
             self._Lam_sqrt = sym_sqrt(self._Lam)
+            Lr = R.T @ L6[3:, 3:] @ R
+            self._Lam_r = 0.5 * (Lr + Lr.T)
+            self._Lam_r_sqrt = sym_sqrt(self._Lam_r)
         return self._Lam
+
+    def elastic_moment(self, R: Array) -> Array:
+        """GIC's rotational elastic moment e_R, body frame, at the current K_R
+        and R_d.  The applied moment is -e_R (plus damping), so the stiffness a
+        measurement sees is d(e_R)/ds = felt_from_KR(K_R) -- NOT K_R."""
+        return 0.5 * vee(self.Kr @ self.R_d.T @ R - R.T @ self.R_d @ self.Kr)
 
     def damping(self, K: Array) -> Array:
         """Factorization design (Albu-Schaeffer et al., 2003)."""
@@ -196,6 +334,8 @@ class Case1Controller:
         Vd_p = np.asarray(prop.Vd, dtype=float).reshape(3)
         Up = np.zeros((3, 3)) if prop.Up is None else np.asarray(prop.Up, dtype=float)
         Up = 0.5 * (Up + Up.T)
+        tau_u_p = (np.zeros(self.nq) if prop.u_tau is None
+                   else np.asarray(prop.u_tau, dtype=float).reshape(self.nq))
 
         # ---- 1. geometric error and potential gradient (world) ----
         p_de = p - self.x_d
@@ -213,44 +353,72 @@ class Case1Controller:
         u_p = D @ Vd_p
 
         # ---- 3. proposal power at the CURRENT applied state ----
-        p_prop = float(v @ u_p) - float(f_G @ Vd_p) + 0.5 * float(p_de @ Up @ p_de)
+        # The rotational stiffness rate's share: d/dt of tr(K_R (I - R_d^T R))
+        # through K_R alone.  tr(I - R_d^T R) = 2(1 - cos theta) >= 0, so
+        # stiffening always injects and loosening always drains, which is the
+        # rotational copy of 1/2 p_de^T U_p p_de.
+        # Matrix form: d/dt of tr(K_R (I - R_d^T R)) through K_R is
+        # tr(U_r (I - R_d^T R)), which reduces to U_r tr(I - R_d^T R) when U_r
+        # is isotropic -- so the scalar callers and tests are unchanged.
+        Ur_p = np.zeros((3, 3)) if prop.Ur is None else as_KR(prop.Ur)
+        rot_gap_m = np.eye(3) - self.R_d.T @ R
+        p_prop = (float(v @ u_p) + float(qd @ tau_u_p)
+                  - float(f_G @ Vd_p) + 0.5 * float(p_de @ Up @ p_de)
+                  + float(np.trace(Ur_p @ rot_gap_m)))
 
         # ---- 4. common power gate ----
         alpha = min(1.0, max(self.E, 0.0) / g.Ec) if g.tank else 1.0
         u = alpha * u_p
+        tau_u = alpha * tau_u_p
         Vd = alpha * Vd_p
         Kdot = alpha * Up
+        Krdot = alpha * Ur_p
         p_T = alpha * p_prop
 
         # ---- 5. passive geometric baseline (never scaled) + gated u ----
         F_lin = -f_G - D @ v + u
-        KR = g.Kr * np.eye(3)
-        e_R = 0.5 * vee(KR @ self.R_d.T @ R - R.T @ self.R_d @ KR)
-        Dr = 2.0 * g.zeta * np.sqrt(g.wrist_inertia * g.Kr)
-        F_b = np.concatenate([R.T @ F_lin, -e_R - Dr * V_b[3:]])
+        # The GIC elastic moment for a MATRIX K_R.  With K_R = kr I this is
+        # kr * vee(skew part) and Dr is 2 zeta sqrt(kr) Lambda_r^1/2, i.e.
+        # exactly the scalar law it replaces.  What it felt like all along is
+        # felt_from_KR(K_R) = 1/2 (tr(K_R) I - K_R), which is kr I only here.
+        Kr_sqrt = sym_sqrt(self.Kr)
+        e_R = self.elastic_moment(R)
+        Dr = (g.zeta * (self._Lam_r_sqrt @ Kr_sqrt + Kr_sqrt @ self._Lam_r_sqrt)
+              if g.wrist_inertia is None else
+              2.0 * g.zeta * np.sqrt(g.wrist_inertia) * Kr_sqrt)
+        F_b = np.concatenate([R.T @ F_lin, -e_R - Dr @ V_b[3:]])
         tau = J_b.T @ F_b
         N = np.eye(self.nq) - J_b.T @ np.linalg.pinv(J_b.T)
-        tau_req = tau + N @ (g.null_kp * (self.q_rest - q) - g.null_kd * qd)
+        tau_req = tau + N @ (g.null_kp * (self.q_rest - q) - g.null_kd * qd) + tau_u
 
         # ---- 6. torque interface: saturation IS delta_tau ----
         tau_appl = np.clip(tau_req, -g.tau_limit, g.tau_limit)
         d_tau = tau_appl - tau_req
         self.robot.set_qf(tau_appl[None, :])
 
-        self._pending = (Vd, Kdot, p_T, dt)
+        self._pending = (Vd, Kdot, Krdot, p_T, dt)
         return {
             "p": p, "R": R, "v": v, "w": R @ V_b[3:],
             "q": q, "qd": qd,
             "x_d": self.x_d.copy(), "K": self.K.copy(), "D": D, "Lambda": Lam.copy(),
+            "kr": self.kr, "Kr": self.Kr.copy(), "Kr_eff": felt_from_KR(self.Kr),
+            "Dr": Dr.copy(), "Lambda_r": self._Lam_r.copy(),
             "f_G": f_G, "alpha": alpha, "E": self.E, "p_prop": p_prop, "p_T": p_T,
+            "u_tau": tau_u,
             "tau_req": tau_req, "tau": tau_appl, "d_tau": d_tau,
             "H_T": 0.5 * float(p_de @ self.K @ p_de),
         }
 
     def advance(self) -> None:
         """Integrate the applied reference, stiffness and tank to t + dt."""
-        Vd, Kdot, p_T, dt = self._pending
+        Vd, Kdot, Krdot, p_T, dt = self._pending
         self.x_d = self.x_d + Vd * dt
+        if np.any(Krdot):
+            # Eigenvalue projection, as for K.  This is where an UNREACHABLE
+            # felt profile is refused: KR_from_felt can be indefinite, and the
+            # clip at kr_lo > 0 is what rejects it instead of approximating it.
+            w, V = np.linalg.eigh(0.5 * (self.Kr + Krdot * dt + (self.Kr + Krdot * dt).T))
+            self.Kr = (V * np.clip(w, self.g.kr_lo, self.g.kr_hi)) @ V.T
         if np.any(Kdot):
             K = self.K + Kdot * dt
             # project onto the bounded SPD set, eigenvalue-wise

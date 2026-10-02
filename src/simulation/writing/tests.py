@@ -124,6 +124,153 @@ hold(sim, 0.5, K_target=C.k_world([1e5, 1e5, 1e5], W))
 check("K_p is clipped at k_hi", float(np.max(np.linalg.eigvalsh(sim.ctl.K))), sim.ctl.g.k_hi, 1e-6)
 
 # ========================================================================== #
+print("\n--- the rotational impedance ----------------------------------------")
+
+
+def rot_err(R, R_d, axis: int = 0) -> float:
+    """SIGNED orientation error about one body axis, degrees.
+
+    Signed, because the thing being measured is overshoot: an unsigned angle
+    turns a wrist that sailed past its reference into one that is simply late.
+    vee of the skew part of R_d^T R is sin(theta) about the error's axis.
+    """
+    E = R_d.T @ R
+    e = 0.5 * np.array([E[2, 1] - E[1, 2], E[0, 2] - E[2, 0], E[1, 0] - E[0, 1]])
+    return float(np.degrees(np.arcsin(np.clip(e[axis], -1.0, 1.0))))
+
+
+def tilt(R, deg, axis=0):
+    th = np.deg2rad(deg)
+    c, s = np.cos(th), np.sin(th)
+    M = {0: [[1, 0, 0], [0, c, -s], [0, s, c]],
+         1: [[c, 0, s], [0, 1, 0], [-s, 0, c]]}[axis]
+    return R @ np.array(M)
+
+
+# A STEP IN THE ORIENTATION REFERENCE, which is what a guessed Dr got wrong.
+# Dr = 2 zeta sqrt(I_guess kr) against the true rotational inertia makes the
+# real damping ratio zeta sqrt(I_guess/Lambda_r); with the stock guess of 0.01
+# that was 0.13 on the heaviest axis, and a 10 deg step then overshoots by
+# more than half of itself.  At zeta = 0.8 it should barely overshoot at all.
+for wi in (None, 0.01):
+    sim.reset(SM.TaskSpec(text="I"))
+    sim.ctl.g.wrist_inertia = wi
+    sim.ctl.kr = 20.0
+    sim.ctl.R_d = tilt(sim.ctl.R_d.copy(), 10.0)     # the error starts at -10 deg
+    err = [rot_err(hold(sim, 0.004)["R"], sim.ctl.R_d) for _ in range(500)]
+    over = max(0.0, max(err))             # degrees PAST the reference
+    name = "fixed Dr" if wi is None else "guessed Dr"
+    note = f"{over:.2f} deg past a 10 deg step, settles at {err[-1]:+.2f}"
+    if wi is None:
+        check_true(f"10 deg orientation step, {name}: overshoot < 1.5 deg", over < 1.5, note)
+    else:
+        check_true(f"10 deg orientation step, {name}: overshoot > 3 deg (the bug)",
+                   over > 3.0, note + " -- this is what was shipped")
+sim.ctl.g.wrist_inertia = None
+
+# The tank pays for a rotational stiffness change, as it does for K_p.  The
+# rotational potential is kr tr(I - R_d^T R), so raising kr by dkr while the
+# wrist sits off its reference costs dkr tr(I - R_d^T R) -- recomputed here
+# from the logged R, not from anything the controller stored.
+sim.reset(SM.TaskSpec(text="I"))
+sim.ctl.kr = 0.3
+sim.ctl.R_d = tilt(sim.ctl.R_d.copy(), 10.0)
+E0, kr0, gaps = sim.ctl.E, sim.ctl.kr, []
+Ur = (3.0 - 0.3) / 0.2
+for _ in range(int(round(0.2 / sim.dt))):
+    rec = sim.step(C.Case1Proposal(np.zeros(3), Ur=Ur))
+    gaps.append(float(np.trace(np.eye(3) - sim.ctl.R_d.T @ rec["R"])))
+want = (sim.ctl.kr - kr0) * float(np.mean(gaps))
+check("tank pays dkr tr(I - R_d^T R) for a K_R change (J)", E0 - sim.ctl.E, want, 0.05,
+      "a variable K_R is an energy source too")
+
+# ... and the same gate throttles it
+sim.reset(SM.TaskSpec(text="I"))
+sim.ctl.kr = 0.3
+sim.ctl.R_d = tilt(sim.ctl.R_d.copy(), 10.0)
+sim.ctl.E = 0.2 * sim.ctl.g.Ec
+kr0 = sim.ctl.kr
+for _ in range(int(round(0.2 / sim.dt))):
+    rec = sim.step(C.Case1Proposal(np.zeros(3), Ur=Ur))
+check("the gate scales a K_R rate by alpha", (sim.ctl.kr - kr0) / (3.0 - 0.3),
+      rec["alpha"], 0.05, "requested 0.3 -> 3 Nm/rad on a nearly empty tank")
+
+sim.reset(SM.TaskSpec(text="I"))
+for _ in range(500):
+    sim.step(C.Case1Proposal(np.zeros(3), Ur=1e4))
+check("K_R is clipped at kr_hi", sim.ctl.kr, sim.ctl.g.kr_hi, 1e-9)
+
+# ========================================================================== #
+# K_R IS NOT THE STIFFNESS THE TOOL FEELS.
+#
+# Measured the way an operator or a perturbation experiment would: offset R_d
+# by a small body rotation about one axis and read the restoring moment the
+# controller actually produces.  The claim is that the slope is
+# felt_from_KR(K_R) = 1/2 (tr(K_R) I - K_R), whose i-th entry is half the sum
+# of the OTHER TWO K_R entries, so it does not depend on K_R[i, i] at all.
+print("\n--- felt rotational stiffness vs the K_R parameter -------------------")
+
+
+def measured_felt(ctl, Kr, deg=0.5):
+    """The stiffness a small-angle probe reads off the controller's own law."""
+    ctl.Kr = C.as_KR(Kr)
+    th = np.deg2rad(deg)
+    out = []
+    for ax in range(3):
+        s = np.zeros(3)
+        s[ax] = th
+        S = np.array([[0, -s[2], s[1]], [s[2], 0, -s[0]], [-s[1], s[0], 0]])
+        R = ctl.R_d @ (np.eye(3) + S + 0.5 * S @ S)          # exp(s^) to 2nd order
+        out.append(float(ctl.elastic_moment(R)[ax]) / th)
+    return np.array(out)
+
+sim.reset(SM.TaskSpec(text="I"))
+for Kr_d in ([10.0, 30.0, 100.0], [50.0, 5.0, 50.0]):
+    got = measured_felt(sim.ctl, Kr_d)
+    want = np.diag(C.felt_from_KR(np.diag(Kr_d)))
+    check(f"probe reads felt_from_KR(K_R) at K_R = {Kr_d} (Nm/rad)",
+          np.max(np.abs(got - want)), 0.0, 1e-3,
+          f"got {np.round(got, 1)}, 1/2(tr K_R I - K_R) = {np.round(want, 1)}")
+    check_true(f"... and NOT K_R itself at K_R = {Kr_d}",
+               np.max(np.abs(got - np.asarray(Kr_d))) > 1.0,
+               f"K_R says {Kr_d}, the tool feels {np.round(got, 1)}")
+
+# The ordering inverts: the axis given the SMALLEST K_R is the stiffest felt.
+got = measured_felt(sim.ctl, [50.0, 5.0, 50.0])
+check_true("softening K_R about one axis makes that axis the STIFFEST felt",
+           int(np.argmax(got)) == 1,
+           "K_R = diag(50, 5, 50) -> felt " + str(np.round(got, 1)))
+
+# Round trip, and what to pass to get a felt profile you asked for.
+want = np.array([50.0, 5.0, 50.0])
+Kr = C.KR_from_felt(want)
+check("KR_from_felt delivers the felt profile asked for (Nm/rad)",
+      np.max(np.abs(measured_felt(sim.ctl, Kr) - want)), 0.0, 1e-3,
+      f"felt {want} needs K_R = {np.round(np.diag(Kr), 1)}")
+
+# ... and some profiles are unreachable, because K_R would be indefinite.
+check_true("felt (50, 5, 50) is reachable", C.felt_reachable(want, sim.ctl.g.kr_lo))
+check_true("felt (5, 5, 50) is NOT: no axis may beat the other two together",
+           not C.felt_reachable([5.0, 5.0, 50.0], sim.ctl.g.kr_lo),
+           "needs K_R = " + str(np.round(np.diag(C.KR_from_felt([5.0, 5.0, 50.0])), 1)))
+# and asking for it anyway is REFUSED by the eigenvalue clip, not approximated
+sim.reset(SM.TaskSpec(text="I"))
+sim.ctl.Kr = np.eye(3) * 1.0
+bad = C.KR_from_felt([5.0, 5.0, 50.0])
+for _ in range(200):
+    sim.step(C.Case1Proposal(np.zeros(3), Ur=(bad - sim.ctl.Kr) / 0.2))
+check_true("an unreachable felt profile is clipped, never approximated",
+           np.linalg.eigvalsh(sim.ctl.Kr).min() >= sim.ctl.g.kr_lo - 1e-9,
+           f"K_R eigenvalues {np.round(np.linalg.eigvalsh(sim.ctl.Kr), 2)}, "
+           f"felt {np.round(np.diag(C.felt_from_KR(sim.ctl.Kr)), 1)} not (5, 5, 50)")
+
+# The scalar path is the matrix path: a regression guard on the generalization.
+sim.reset(SM.TaskSpec(text="I"))
+check("isotropic K_R feels exactly like itself (Nm/rad)",
+      np.max(np.abs(measured_felt(sim.ctl, 20.0) - 20.0)), 0.0, 1e-3,
+      "K_eff = kr I only when K_R = kr I -- which is why a scalar hid all of this")
+
+# ========================================================================== #
 print("\n--- ink, tearing, scoring -------------------------------------------")
 sim.reset(SM.TaskSpec(text="I"))
 sim.ctl.K = C.k_world([2000.0, 2000.0, 300.0], W)

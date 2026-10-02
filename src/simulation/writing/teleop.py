@@ -128,8 +128,9 @@ class TeleopSession:
         self.bwd = DelayLine(self.mp.delay_bwd, dt)
         self.fwd.fill(self.x_d0)
         self.K_cmd = sim.k_diag()
+        self.kr_cmd = None
 
-    def step(self, f_h: Array, k_target: Array) -> dict:
+    def step(self, f_h: Array, k_target: Array, kr_target: float | None = None) -> dict:
         sim, mp, dt = self.sim, self.mp, self.sim.dt
         # ---- master: Mm a = f_h + f_fb + f_wall - Bm v ----
         d = self.x_m - self.x_m0
@@ -140,16 +141,26 @@ class TeleopSession:
         x_d_req = self.fwd.push_and_get(self.x_d0 + mp.scale * (self.x_m - self.x_m0))
 
         # ---- Case 1 proposal: deadbeat, so with the gate open applied == requested ----
+        # `kr_target` is the operator's ROTATIONAL stiffness, in the same slot
+        # and on the same terms as K_p: a rate, metered and gated.  Writing
+        # never sets it and the pen is a sphere, so nothing there notices; the
+        # wiping protocol (../wiping/protocol.py) sets a level per phase,
+        # because that is the stiffness a flat pad on a turning surface has to
+        # choose.  None leaves K_R wherever the gains put it.
         self.K_cmd = np.asarray(k_target, dtype=float)
         K_req = C.k_world(self.K_cmd, sim.W)
+        self.kr_cmd = None if kr_target is None else float(kr_target)
         prop = C.Case1Proposal(Vd=(x_d_req - sim.ctl.x_d) / dt,
-                               Up=(K_req - sim.ctl.K) / dt)
+                               Up=(K_req - sim.ctl.K) / dt,
+                               Ur=(None if self.kr_cmd is None
+                                   else (self.kr_cmd - sim.ctl.kr) / dt))
         rec = sim.step(prop)
 
         # ---- reflected force: the spring the slave is stretching ----
         self.f_fb = self.bwd.push_and_get(mp.kf * rec["f_G"] / mp.scale)
         rec.update(x_m=self.x_m.copy(), v_m=self.v_m.copy(), f_h=np.asarray(f_h, float).copy(),
-                   f_fb=self.f_fb.copy(), x_d_req=x_d_req, k_req=self.K_cmd.copy())
+                   f_fb=self.f_fb.copy(), x_d_req=x_d_req, k_req=self.K_cmd.copy(),
+                   kr_req=sim.ctl.kr if self.kr_cmd is None else self.kr_cmd)
         return rec
 
 

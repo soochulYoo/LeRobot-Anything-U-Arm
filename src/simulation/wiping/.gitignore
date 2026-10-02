@@ -1,0 +1,12 @@
+# generated at import by wipe_scene.py (absolute mesh paths, machine-specific)
+assets/
+# regenerable from seeds with protocol.py / record.py
+demos/
+*.mp4
+__pycache__/
+runs/
+logs/
+# fitted surface models, rebuilt by train_surface.py
+data/*.pt
+# 335 MB of sampled surface, rebuilt by patchy_surface.py / curved_probe.py
+data/surface.npz

@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=writing_d_cross_cond
-#SBATCH --partition=suma_a6000
-#SBATCH --exclude=cs-gpu-01
+#SBATCH --partition=suma_a6000,base_suma_rtx3090,gigabyte_a6000,dell_rtx3090
+#SBATCH --exclude=cs-gpu-01,node29
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --array=0-2
+#SBATCH --requeue
 #SBATCH --time=04:00:00
 #SBATCH --output=logs/%x_%A_%a.log
 

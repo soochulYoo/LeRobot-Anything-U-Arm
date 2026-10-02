@@ -13,10 +13,15 @@ from __future__ import annotations
 import argparse
 import sys
 
+import pathlib
+
 import numpy as np
 from PIL import Image
 
-sys.path.insert(0, "/home/soochul/LeRobot-Anything-U-Arm/src/simulation")
+# APPEND, never insert: src/simulation contains a `mani_skill/` directory that
+# would otherwise shadow the installed ManiSkill and send the agent loader off
+# looking for assets it does not have.
+sys.path.append(str(pathlib.Path(__file__).resolve().parent.parent))
 from record_demo import annotate, frame_of, save
 
 import wipe as W

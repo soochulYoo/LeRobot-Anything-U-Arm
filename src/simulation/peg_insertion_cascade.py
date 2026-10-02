@@ -242,6 +242,38 @@ def rollout(s, Ko: np.ndarray, lateral_err: np.ndarray, args,
     Ma, Br = 3.0 * np.eye(3), 25.0 * np.eye(3)
     x_r, v_r = p_tcp0.copy(), np.zeros(3)
 
+    # ---- optional SEARCH phase -------------------------------------------
+    # A real insertion demonstration does not aim and push: it puts the peg on
+    # the face near the hole, presses, and scrubs until the head drops into the
+    # aperture.  That is the motion worth having as data, because it is where
+    # lateral compliance earns its keep -- a stiff lateral wrist skates over the
+    # edge instead of being drawn in.
+    # search_s = 0 keeps the original aim-and-push behaviour, so the frame study
+    # above is unaffected.
+    #
+    # Geometry, which the first version of this got wrong.  hole_frame's origin
+    # is the box CENTRE, and the box is as deep as the peg is long, so the
+    # entrance face sits at x = -half_len and the goal puts the peg centre
+    # exactly on that face (its head at the centre).  `at_hole[0]` is the head's
+    # x there, so depth past the face is at_hole[0] + half_len -- the earlier
+    # catch test (at_hole[0] > 6 mm) asked for 6 mm past the hole CENTRE, which
+    # the scrub command could never reach, and the scrub target was 4 mm short
+    # of full insertion, i.e. pressing the head through 80 mm of solid wall.
+    # There is also no chamfer: the aperture is a square of half-width
+    # radius + 3 mm cut by four boxes, so the edge is sharp and the whole
+    # tolerance is that 3 mm of clearance.
+    search_s = float(getattr(args, "search_s", 0.0))
+    e1, e2 = Rh[:, 1], Rh[:, 2]                      # the hole's lateral axes
+    search = dict(found=None, catch_p=None,
+                  r0=float(getattr(args, "search_r0", 0.001)),
+                  growth=float(getattr(args, "search_growth", 0.012)),
+                  turns=float(getattr(args, "search_turns", 5.0)),
+                  press=float(getattr(args, "search_press", 8.0)),
+                  depth=float(getattr(args, "search_depth", 0.003)),
+                  catch=float(getattr(args, "search_catch", 0.005)))
+    # peg centre that puts the head `depth` past the entrance face
+    face_peg = goal_peg - (half_len - search["depth"]) * axis
+
     pre_peg = goal_peg - standoff * axis + lateral_err
     log = {k: [] for k in ["t", "f", "f_vec", "depth", "peg", "tcp"]}
     n = int(args.duration / dt)
@@ -251,6 +283,28 @@ def rollout(s, Ko: np.ndarray, lateral_err: np.ndarray, args,
             a = t / args.align_s
             peg_target = peg_p0 + a * (pre_peg - peg_p0)
             f_d = np.zeros(3)
+        elif search_s > 0.0 and search["found"] is None and t < args.align_s + search_s:
+            # press the head onto the face and spiral outwards from the believed
+            # hole centre until it drops in
+            a = (t - args.align_s) / search_s
+            rad = search["r0"] + search["growth"] * a
+            th = 2.0 * np.pi * search["turns"] * a
+            lat = rad * (np.cos(th) * e1 + np.sin(th) * e2)
+            peg_target = face_peg + lateral_err + lat
+            f_d = search["press"] * axis
+        elif search_s > 0.0:
+            # push in from wherever the scrub left the peg: if it caught, that
+            # position already carries the lateral correction the search found,
+            # and if it timed out this pushes blindly and fails, which is the
+            # honest outcome.
+            if search["found"] is None:
+                search["found"] = t
+                search["catch_p"] = u.peg.pose.p[0].cpu().numpy().copy()
+            a = min(1.0, (t - search["found"]) / args.insert_s)
+            p0 = search["catch_p"]
+            travel = float((goal_peg - p0) @ axis) + args.overdrive
+            peg_target = p0 + a * travel * axis
+            f_d = args.f_push * axis * a
         else:
             a = min(1.0, (t - args.align_s) / args.insert_s)
             peg_target = pre_peg + a * ((goal_peg + lateral_err) - pre_peg) + a * args.overdrive * axis
@@ -304,6 +358,11 @@ def rollout(s, Ko: np.ndarray, lateral_err: np.ndarray, args,
         u.scene.step()
 
         ok, at_hole = u.has_peg_inserted()
+        if search_s > 0.0 and search["found"] is None and t > args.align_s:
+            # caught when the head sits deeper than the entrance face
+            if float(at_hole[0, 0]) + half_len > search["catch"]:
+                search["found"] = t
+                search["catch_p"] = u.peg.pose.p[0].cpu().numpy().copy()
         if on_frame is not None and every > 0 and step % every == 0:
             on_frame(t, float(at_hole[0, 0]), float(np.linalg.norm(f_e)))
         log["t"].append(t)
@@ -316,6 +375,12 @@ def rollout(s, Ko: np.ndarray, lateral_err: np.ndarray, args,
     ok, at_hole = u.has_peg_inserted()
     out["success"] = bool(ok[0])
     out["final_at_hole"] = at_hole[0].cpu().numpy()
+    out["search_found_s"] = search["found"] if search_s > 0.0 else None
+    out["search_caught"] = bool(search_s > 0.0 and search["catch_p"] is not None
+                               and search["found"] < args.align_s + search_s)
+    out["face_depth"] = out["depth"] + half_len     # head depth past the face
+    out["half_len"] = half_len
+    out["hole_half_w"] = float(u.box_hole_radii[0])
     return out
 
 
@@ -417,6 +482,17 @@ def main() -> None:
     ap.add_argument("--insert-s", type=float, default=4.0)
     ap.add_argument("--duration", type=float, default=10.0)
     ap.add_argument("--lateral-mm", type=float, default=0.0)
+    ap.add_argument("--search-s", type=float, default=0.0,
+                    help="seconds of spiral search on the face before pushing "
+                         "(0 = the original aim-and-push)")
+    ap.add_argument("--search-r0", type=float, default=0.001, help="m, start radius")
+    ap.add_argument("--search-growth", type=float, default=0.012, help="m added over the search")
+    ap.add_argument("--search-turns", type=float, default=5.0)
+    ap.add_argument("--search-press", type=float, default=8.0, help="N onto the face")
+    ap.add_argument("--search-depth", type=float, default=0.003,
+                    help="m the aim sits past the face, so the peg stays pressed")
+    ap.add_argument("--search-catch", type=float, default=0.005,
+                    help="m past the entrance face that counts as having dropped in")
     args = ap.parse_args()
 
     s = setup(args.seed, args.grip_back)

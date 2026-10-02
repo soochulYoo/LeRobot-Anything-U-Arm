@@ -52,22 +52,56 @@ import data as DATA  # noqa: E402
 class FlowPolicy:
     """evaluate.py's policy interface: reset(goal, obs) and act(obs)."""
 
-    def __init__(self, ckpt, n_exec: int = 3, seed: int = 0):
+    def __init__(self, ckpt, n_exec: int = 3, seed: int = 0, d_lead: int | None = None):
         import jax
         from flax import nnx
 
         import train as TR
         self.jax = jax
-        self.model, self.cfg, self.stats, _ = TR.load_checkpoint(ckpt)
+        self.model, self.cfg, self.stats, self.extra = TR.load_checkpoint(ckpt)
+        # SAMPLING-ONLY OVERRIDE.  d_lead changes (d)'s inference schedule and
+        # nothing in its loss, so the honest way to measure it is to run ONE set
+        # of weights both ways.  Retraining with D_LEAD=3 instead gave different
+        # weights at every seed -- GPU training is not bit-reproducible across
+        # nodes -- so that comparison mixed the schedule with retraining noise
+        # (+2.3 +- 6.0 pp, t = 1.07, better 4/8 and worse 2/8: indistinguishable).
+        if d_lead is not None:
+            self.cfg = dataclasses.replace(self.cfg, d_lead=int(d_lead))
+            self.model.cfg = self.cfg        # CrossCond.sample reads the model's
         self._sample = nnx.jit(lambda m, b, k: m.sample(b, k))
         self.n_exec = n_exec
         self.key = jax.random.key(seed)
         self.plans: list[dict] = []
+        # A policy trained with --surprise reads nine channels
+        # [measured | expected | z], and the expected half needs the expectation
+        # model AT INFERENCE.  Its path comes from the checkpoint's own args, so
+        # nothing has to be passed in and a surprise policy cannot be rolled out
+        # against the wrong one.
+        self.sur = None
+        if self.cfg.ft_in == DATA.FT_SUR:
+            import surprise as SUR
+            npz = (self.extra.get("args") or {}).get("surprise")
+            if not npz:
+                raise ValueError(
+                    f"{ckpt} was trained with nine force channels but its args carry no "
+                    "--surprise path, so the expectation model cannot be located")
+            dp = SUR.deploy_path(npz)
+            if not pathlib.Path(dp).exists():
+                raise FileNotFoundError(
+                    f"{dp} missing: the folds were written without a deploy model. "
+                    "Run  python3 policy/surprise.py --deploy-only --data <demos>  "
+                    "to fit it without touching the npz the policy was trained on.")
+            self.sur = SUR.Deploy(dp)
 
     def reset(self, goal, obs) -> None:
         self.gp = DATA.goal_points(goal["strokes_world"], goal["mask"])
         self.origin = np.asarray(goal["belief_origin"], dtype=np.float64)
+        self.W = np.asarray(goal["belief_R"], dtype=np.float64)   # paper u, v, n
         self.hist = deque([np.asarray(obs["f_contact"], np.float32)] * DATA.HIST, maxlen=DATA.HIST)
+        # mu/sigma histories, filled per frame beside the measured one so the
+        # three windows stay aligned exactly as data.attach_surprise aligns them
+        self.mu_hist = deque(maxlen=DATA.HIST)
+        self.sd_hist = deque(maxlen=DATA.HIST)
         self.queue: list[dict] = []
         self.plans = []
 
@@ -81,14 +115,45 @@ class FlowPolicy:
                                  obs["qpos"], self.origin)[None].astype(np.float32),
             goal=(self.gp - x_d[:2]).reshape(1, -1).astype(np.float32),
             ft_hist=np.stack(self.hist)[None])
-        b = {k: jnp.asarray(v) for k, v in DATA.features(**raw, stats=self.stats).items()}
+        # force=self.cfg.force, so a policy trained force-blind stays blind here
+        if self.sur is not None:
+            # expectation for THIS frame, then the nine channels through the one
+            # shared assembler data.attach_surprise also uses
+            mu, sd = self.sur.predict(raw["top"], raw["wrist"], raw["state"], raw["goal"])
+            if not self.mu_hist:
+                for _i in range(DATA.HIST):
+                    self.mu_hist.append(mu[0])
+                    self.sd_hist.append(sd[0])
+            else:
+                self.mu_hist.append(mu[0])
+                self.sd_hist.append(sd[0])
+            raw["ft_hist"] = DATA.surprise_channels(
+                raw["ft_hist"], np.stack(self.mu_hist)[None], np.stack(self.sd_hist)[None])
+        b = {k: jnp.asarray(v) for k, v in DATA.features(
+            **raw, stats=self.stats, force=getattr(self.cfg, "force", True)).items()}
         self.key, k = self.jax.random.split(self.key)
         a, z = self._sample(self.model, b, k)
         a = self.stats.denorm("act", np.asarray(a)[0])
-        targets = x_d + a[:, :3]
-        k_diag = np.exp(a[:, 3:])
-        self.queue = [{"x_d": targets[j], "k_diag": k_diag[j]} for j in range(self.n_exec)]
-        self.plans.append(dict(t=float(obs["t"]), k=k_diag,
+        if DATA.is_spring(self.cfg.layout):
+            # x_ref + f_d + log K.  The controller does the K^-1 f_d, so a
+            # stiffness error does not become a force error here either --
+            # evaluate.WritingPolicyEnv.step.
+            # spring: absolute, anchored on x_d(t).  spring_rel: pass the DELTA
+            # through and let the env add the measured tip (evaluate.py).
+            x_ref = (a[:, :3] if self.cfg.layout == "spring_rel" else x_d + a[:, :3])
+            f_d = a[:, 3:6]
+            k_diag = np.exp(a[:, 6:9])
+            self.queue = [{"x_ref": x_ref[j], "f_d": f_d[j], "k_diag": k_diag[j]}
+                          for j in range(self.n_exec)]
+            # the future wrench this action implies, in the same world frame and
+            # sign as a predicted one, so the two are directly comparable
+            f_impl = -(f_d @ np.asarray(self.W).T)
+        else:
+            targets = x_d + a[:, :3]
+            k_diag = np.exp(a[:, 3:])
+            self.queue = [{"x_d": targets[j], "k_diag": k_diag[j]} for j in range(self.n_exec)]
+            f_impl = None
+        self.plans.append(dict(t=float(obs["t"]), k=k_diag, f_implied=f_impl,
                                f_pred=None if z is None else self.stats.denorm("fut_ft", np.asarray(z)[0])))
 
     def act(self, obs):
@@ -107,7 +172,8 @@ def stiffness_summary(t, k, pressure, height, v_plane, ink_force=0.8) -> dict:
     air_move = (height > 0.004) & (v_plane > 0.008) & ~contact
     hover = (height < 0.015) & (height > 0.0005) & (v_plane < 0.003) & ~contact & (np.arange(len(t)) < first)
     m = lambda sel, i: float(k[sel, i].mean()) if sel.any() else float("nan")
-    return dict(contact_ku=m(contact, 0), contact_kn=m(contact, 2),
+    return dict(contact_f=float(pressure[contact].mean()) if contact.any() else float("nan"),
+                contact_ku=m(contact, 0), contact_kn=m(contact, 2),
                 approach_kn=m(air_move, 2), approach_ku=m(air_move, 0),
                 hover_ku=m(hover, 0), hover_kn=m(hover, 2))
 
@@ -150,19 +216,25 @@ def demo_reference(root) -> dict:
 
 # --------------------------------------------------------------------------- #
 _ENV = _POL = None
+_HARD: dict = {}
 
 
-def _init(ckpt, n_exec):
-    global _ENV, _POL
+def _init(ckpt, n_exec, hard=None, d_lead=None):
+    global _ENV, _POL, _HARD
     from evaluate import WritingPolicyEnv
-    _ENV = WritingPolicyEnv(control_hz=10.0, cameras=True)
-    _POL = FlowPolicy(ckpt, n_exec=n_exec)
+    # The policy is loaded FIRST so the env can be built with the anchor its
+    # layout implies.  Getting this wrong is silent: a spring_rel policy decoded
+    # with spring's anchor is a different controller, and nothing raises.
+    _POL = FlowPolicy(ckpt, n_exec=n_exec, d_lead=d_lead)
+    _ENV = WritingPolicyEnv(control_hz=10.0, cameras=True,
+                            rel_anchor=(_POL.cfg.layout == "spring_rel"))
+    _HARD = dict(hard or {})
 
 
 def _job(job):
     import protocol as P
     c, text, attempt, duration = job
-    spec, _, seed = P.episode_spec(text, c, attempt, 60_000)
+    spec, _, seed = P.episode_spec(text, c, attempt, 60_000, **_HARD)
     spec = dataclasses.replace(spec, time_limit=duration)
     t0 = time.time()
     res = run_episode(_ENV, _POL, spec)
@@ -216,6 +288,40 @@ def main() -> None:
     ap.add_argument("--n-exec", type=int, default=3)
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--out", default=None)
+    # (d) only, SAMPLING-ONLY: re-evaluate an existing checkpoint with the wrench
+    # field N steps ahead.  Same weights, different schedule -- the comparison
+    # retraining cannot give.
+    ap.add_argument("--d-lead", type=int, default=None)
+    # THE PAPER'S HIDDEN POSE RANGE AT EVALUATION TIME.
+    # The demonstrations were collected at dz = 4 mm and tilt = 5 deg, and the
+    # standard evaluation uses the same numbers -- which is why every structure
+    # reproduces the demonstrated stiffness to 0.1% and the stiffness axis of
+    # the comparison is saturated (policy/runs/COMPARISON.md).  A stiffness only
+    # earns its keep when the surface is NOT where the policy expected it, so
+    # raise the range and the comparison has somewhere to go.  Nothing is
+    # re-collected: this is test-time shift, and the demos stay as they are.
+    ap.add_argument("--dz", type=float, default=0.004, help="m, paper height error (demos: 0.004)")
+    ap.add_argument("--tilt-deg", type=float, default=5.0, help="deg, paper tilt (demos: 5.0)")
+    ap.add_argument("--dz-sweep", default=None,
+                    help="comma-separated dz values in mm -- one evaluation per value")
+    # TILT IS THE STRESSOR, NOT dz, and this was measured the hard way.
+    # dz is a CONSTANT height offset, and the policy absorbs it exactly as the
+    # operator does: it descends until it feels contact and then presses.  Swept
+    # to 20 mm, act_ft_input/seed0 still succeeded and in-band moved 99.8 ->
+    # 96.6%.  A flat curve, and six GPU-hours to learn it.
+    # Tilt is deviation DURING contact.  Over a 37 mm glyph the surface height
+    # ranges w tan(theta), so at k_n = 1000 N/m the force swings by that many
+    # newtons and the sizing rule k_n <~ (f - F_lo)/delta caps k_n at:
+    #     tilt   5 deg -> 3.2 mm swing, k_n <~ 1236   (the demos: k_n = 1000, at its limit)
+    #            8 deg -> 5.2 mm,       k_n <~  769
+    #           12 deg -> 7.9 mm,       k_n <~  509
+    #           20 deg -> 13.5 mm,      k_n <~  297   (band is 1-6 N, tear 12 N)
+    # So a policy that memorised k_n = 1000 should start losing the band around
+    # 8-12 deg, and one trained at a larger --robust-delta should command a softer
+    # k_n and outlive it.  That crossover is the experiment.
+    ap.add_argument("--tilt-sweep", default=None,
+                    help="comma-separated tilt values in deg, e.g. 5,8,12,16,20 -- "
+                         "the axis that actually loads the stiffness")
     args = ap.parse_args()
 
     import multiprocessing as mp
@@ -228,7 +334,63 @@ def main() -> None:
     dur = {t: 1.3 * max(r["t"] for r in rows if r["text"] == t) for t in args.texts}
     jobs = [(c, t, args.first_attempt + i, dur[t]) for c, t in enumerate(args.texts) for i in range(args.episodes)]
     t0 = time.time()
-    with mp.get_context("spawn").Pool(args.workers, initializer=_init, initargs=(str(ckpt), args.n_exec)) as pool:
+
+    def run_at(hard: dict) -> list:
+        with mp.get_context("spawn").Pool(args.workers, initializer=_init,
+                                          initargs=(str(ckpt), args.n_exec, hard,
+                                                    args.d_lead)) as pool:
+            return list(pool.imap_unordered(_job, jobs))
+
+    # ---- the stress sweep -------------------------------------------------
+    # One evaluation per paper-height range, nominal first.  This is the curve
+    # the stiffness axis of COMPARISON.md cannot show: at the demos' own 4 mm
+    # every structure succeeds and commands the demonstrated K to 0.1%, so the
+    # question "did it choose a stiffness or memorise one" has no room to be
+    # asked.  Where each policy's success falls off IS the answer.
+    if args.dz_sweep or args.tilt_sweep:
+        if args.tilt_sweep:
+            axis, unit = "tilt_deg", "deg"
+            vals = [float(v) for v in args.tilt_sweep.split(",")]
+            fixed = dict(dz=args.dz)
+            held = f"dz {1000 * args.dz:.0f} mm"
+        else:
+            axis, unit = "dz", "mm"
+            vals = [float(v) / 1000.0 for v in args.dz_sweep.split(",")]
+            fixed = dict(tilt_deg=args.tilt_deg)
+            held = f"tilt {args.tilt_deg} deg"
+        shown = (lambda v: 1000 * v) if axis == "dz" else (lambda v: v)
+        print(f"{ckpt}\n  {axis} sweep {args.tilt_sweep or args.dz_sweep} {unit}, "
+              f"{held} held, {len(jobs)} episodes each")
+        print(f"  {axis + ' ' + unit:>9}{'success':>9}{'coverage':>10}{'in band':>9}"
+              f"{'contact N':>11}{'peak N':>8}{'K_n':>7}{'K_u':>7}  top failures")
+        curve = []
+        for v in vals:
+            rs = run_at({axis: v, **fixed})
+            m = lambda k: float(np.nanmean([r[k] for r in rs]))
+            from collections import Counter
+            why = Counter(x for r in rs for x in r["fail_reason"].split(",") if x)
+            row = dict(axis=axis, x=shown(v),
+                       dz_mm=1000 * (v if axis == "dz" else args.dz),
+                       tilt_deg=(v if axis == "tilt_deg" else args.tilt_deg),
+                       success=float(np.mean([r["success"] for r in rs])),
+                       **{k: m(k) for k in ("coverage", "precision", "in_band", "contact_f",
+                                            "peak_force", "contact_kn", "contact_ku")},
+                       failures=dict(why))
+            curve.append(row)
+            print(f"  {shown(v):9.0f}{100 * row['success']:8.0f}%{100 * row['coverage']:9.1f}%"
+                  f"{100 * row['in_band']:8.1f}%{row['contact_f']:10.2f} {row['peak_force']:7.1f}"
+                  f"{row['contact_kn']:7.0f}{row['contact_ku']:7.0f}  "
+                  + ", ".join(f"{k} x{v}" for k, v in why.most_common(3)), flush=True)
+        name = "tilt_sweep.json" if axis == "tilt_deg" else "dz_sweep.json"
+        (out / name).write_text(json.dumps(dict(
+            ckpt=str(ckpt), axis=axis, held=held, curve=curve), indent=1))
+        print(f"\n  wrote {out / name}  ({(time.time() - t0) / 60:.1f} min)")
+        return
+
+    with mp.get_context("spawn").Pool(args.workers, initializer=_init,
+                                      initargs=(str(ckpt), args.n_exec,
+                                                dict(dz=args.dz, tilt_deg=args.tilt_deg),
+                                                args.d_lead)) as pool:
         results = []
         for r in pool.imap_unordered(_job, jobs):
             results.append(r)
@@ -245,8 +407,8 @@ def main() -> None:
         rs = [r for r in results if r["case"] == c]
         m = lambda k: float(np.nanmean([r[k] for r in rs]))
         s = dict(success=float(np.mean([r["success"] for r in rs])), **{k: m(k) for k in (
-            "coverage", "precision", "in_band", "peak_force", "contact_ku", "contact_kn",
-            "approach_kn", "hover_ku", "hover_kn")})
+            "coverage", "precision", "in_band", "peak_force", "contact_f", "contact_ku",
+            "contact_kn", "approach_kn", "hover_ku", "hover_kn")})
         summary[t] = s
         d = ref.get(c, {})
         print(f"  {t:<9}{100 * s['success']:8.0f}%{100 * s['coverage']:9.1f}%{100 * s['precision']:9.1f}%"
@@ -262,9 +424,25 @@ def main() -> None:
     slim = [{k: v for k, v in r.items() if k not in ("trace", "ink", "target")} for r in results]
     (out / "results.json").write_text(json.dumps(dict(summary=summary, demo_reference=ref,
                                                       episodes=slim), indent=1))
+    # Every episode's ink and its own target, for policy/plot_overlay.py: the
+    # paper is randomized per episode, so each drawing only means anything
+    # beside the target it was aiming at.
+    traces = {}
+    for r_ in results:
+        tag = f"c{r_['case']}_s{r_['seed']}"
+        traces[f"{tag}_ink"] = np.asarray(r_["ink"], np.float32).reshape(-1, 2)
+        traces[f"{tag}_tgt"] = np.concatenate([np.asarray(s, np.float32) for s in r_["target"]])
+        traces[f"{tag}_ok"] = np.asarray([r_["success"]])
+        # the force and stiffness the episode actually ran at, at policy rate,
+        # for policy/plot_force.py -- results.json drops the trace as too bulky
+        tr = r_["trace"]
+        traces[f"{tag}_t"] = np.asarray(tr["t"], np.float32)
+        traces[f"{tag}_f"] = np.asarray(tr["f"], np.float32)
+        traces[f"{tag}_k"] = np.asarray(tr["k"], np.float32)
+    np.savez_compressed(out / "traces.npz", **traces)
     plot(sorted(results, key=lambda r: r["seed"]), ref, out / "rollouts.png",
          f"{ckpt.parent.name}: first unseen randomization per case")
-    print(f"  wrote {out / 'results.json'} and {out / 'rollouts.png'}")
+    print(f"  wrote {out / 'results.json'}, {out / 'rollouts.png'} and {out / 'traces.npz'}")
 
 
 if __name__ == "__main__":
