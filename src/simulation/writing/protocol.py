@@ -225,10 +225,12 @@ class KeyboardWriter:
     RELEASE = 0.15     # s
     F_CLEAR = 0.2      # N of pressure, below which the pen is off the paper
 
-    def __init__(self, window, sim):
+    def __init__(self, window, sim, latch: bool = False):
         import interactive as I
         self.win, self.sim = window, sim
-        self.hand = I.KeyboardHuman(window, sim.W, sim.K0)
+        # `latch` is the hand that needs no two keys at once: the same forces, tapped
+        # instead of held.  See interactive.LatchedHand for why that is not a preference.
+        self.hand = (I.LatchedHand if latch else I.KeyboardHuman)(window, sim.W, sim.K0)
         self.strokes = sim.target.strokes
         self.phase, self.k, self.done = "travel", 0, False
         self._idle = 0.0
@@ -244,8 +246,9 @@ class KeyboardWriter:
     def act(self, t: float, x_m, v_m, f_fb, tip) -> tuple[np.ndarray, None]:
         """(f_h, None): the stiffness is not the hand's to return here."""
         f_h, _ = self.hand.wrench(t, x_m, v_m, f_fb)
-        lift = self.win.key_down("o")
-        press = self.win.key_down("u") and not lift
+        # The hand answers these, not the keys: a latched hand means something different
+        # by "pressing" than a held one, and only it knows which.
+        lift, press = self.hand.lift, self.hand.press
         self._idle = 0.0 if press else self._idle + self.sim.dt
         let_go = lift or self._idle > self.RELEASE
         last = self.sim.last

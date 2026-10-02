@@ -353,6 +353,47 @@ class Arms:
         self.queue.append(arm)
 
 
+class SplitLevels:
+    """Levels from two sources at once: `own` owns `axes`, the protocol table owns the
+    rest.  Same three methods as KeyboardLevels, so run_episode cannot tell.
+
+    WHY THE TABLE SHOULD DRIVE xy AND z.  Those two are a lookup on the task phase, and
+    the reference work measured eight architectures reproducing a phase-indexed stiffness
+    table to 97.7-97.9% -- a person hand-keying it adds reaction noise and no signal, on
+    top of steering.  K_R is the axis the sweep measured the task to be decided by, so it
+    is the axis worth a person's attention and a helper's.  One AutoUser instance is
+    shared by every arm, so the two axes nobody is being compared on behave IDENTICALLY
+    in all of them.
+    """
+
+    def __init__(self, own, auto, axes):
+        self.own, self.auto, self.axes = own, auto, tuple(axes)
+        self._level = [MID, MID, MID]
+
+    @property
+    def level(self):
+        return self._level
+
+    def _merge(self):
+        new = list(self.auto.level)
+        for i in self.axes:
+            new[i] = self.own.level[i]
+        return new
+
+    def reset(self) -> None:
+        self.own.reset()
+        self.auto.reset()
+        self._level = self._merge()
+
+    def poll(self, t: float, group: str) -> bool:
+        self.own.poll(t, group)
+        self.auto.poll(t, group)
+        new = self._merge()
+        changed = new != self._level
+        self._level = new
+        return changed
+
+
 _HELPERS: dict = {}           # arm -> HelperUser: torch.load is not cheap
 
 
@@ -371,7 +412,8 @@ def arm_user(sim, levels, args, arm: str, table):
     every arm change.
     """
     if arm == "manual":
-        return table, dict(skill="human", arm=arm, axes=[])
+        return table, dict(skill="human", arm=arm, axes=[],
+                           person_axes=sorted(getattr(table, "axes", (0, 1, 2))))
     if arm not in _HELPERS:
         import helper_user as HU
         # BOTH generations are checkpoints: v0 is the model trained on the tier demos and
@@ -438,7 +480,8 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
     if human:
         if viewer is None:
             raise RuntimeError("--motion human needs a window")
-        wr = WP.KeyboardWriter(viewer.window, sim)
+        wr = WP.KeyboardWriter(viewer.window, sim,
+                               latch=getattr(args, "keys", "latch") == "latch")
     else:
         wr = WT.SyntheticWiper(sim, dataclasses.replace(style, hover_dwell=args.dwell,
                                                         v_desc=args.v_desc,
@@ -653,6 +696,13 @@ def main() -> None:
     ap.add_argument("--motion", choices=("wiper", "human"), default="wiper",
                     help="who moves the pad: the synthetic wiper, or a person on "
                          "IJKL/U/O (writing/protocol.py's KeyboardWriter; R ends it)")
+    ap.add_argument("--keys", choices=("latch", "hold"), default="latch",
+                    help="--motion human: `latch` taps to set a direction and needs no "
+                         "two keys at once; `hold` is the original held-key hand")
+    ap.add_argument("--auto-axes", nargs="+", default=None,
+                    help="axes the protocol table drives in EVERY arm, so nobody is "
+                         "compared on them.  Default `t n` for a human session and "
+                         "`none` otherwise, which leaves existing collection untouched")
     ap.add_argument("--arms", nargs="+", default=None,
                     choices=("manual", "v0", "v1"),
                     help="interleave these arms, one draw per episode, not announced: "
@@ -701,6 +751,11 @@ def main() -> None:
                      "filtered on the helper's own output and the comparison would be "
                      "biased before it started.  Filter afterwards, in the report.")
         args.arms = sorted(set(args.arms))
+    if args.auto_axes is None:
+        args.auto_axes = (["t", "n"] if (args.motion == "human" or args.arms)
+                          else ["none"])
+    if args.auto_axes != ["none"] and not set(args.auto_axes) <= set(AXIS_OF):
+        ap.error(f"--auto-axes takes {' '.join(AXIS_OF)} or none")
     if args.motion == "human" and args.headless:
         ap.error("--motion human needs a window: nobody can press keys without one")
     if args.headless and not args.auto_user:
@@ -777,20 +832,38 @@ def main() -> None:
 
     if viewer is not None:
         print(__doc__.split("Usage:")[0].split("THE PROTOCOL")[1].split("A level change")[0])
-        print("  keys    xy 1/2/3   z 8/9/0   K_R 4/5/6   M all mid   G go   N abort   ESC quit")
+        print("  levels  " + "   ".join(
+            n + " " + k for n, k, i in (("xy", "1/2/3", 0), ("z", "8/9/0", 1),
+                                        ("K_R", "4/5/6", 2)) if i in person_ax)
+            + ("   (the table drives " + "/".join(("xy", "z", "K_R")[i]
+                                                  for i in range(3) if i not in person_ax)
+               + ")" if len(person_ax) < 3 else "")
+            + "   G go   N abort   ESC quit")
         if args.motion == "human":
-            print("  hand    IJKL slide   U press   O lift   SHIFT faster   R demo finished")
+            print("  hand    " + ("I/J/K/L tap to sweep (tap again to stop)   U press   "
+                                  "O lift   F faster   X stop all   R demo finished"
+                                  if args.keys == "latch" else
+                                  "IJKL slide   U press   O lift   SHIFT faster   "
+                                  "R demo finished"))
         if args.arms:
             print(f"  arms    {' '.join(args.arms)}  interleaved, "
                   f"{'ANNOUNCED' if args.show_arm else 'not announced'}"
                   f" (schedule seed {args.arm_seed})")
         print()
 
-    table = None if args.auto_user else KeyboardLevels(viewer.window)
+    auto_ax = () if args.auto_axes == ["none"] else tuple(AXIS_OF[a] for a in args.auto_axes)
+    person_ax = tuple(i for i in range(3) if i not in auto_ax)
+    helper_ax = tuple(AXIS_OF[a] for a in args.helper_axes)
+    if args.auto_user:
+        table = None
+    elif auto_ax:
+        table = SplitLevels(KeyboardLevels(viewer.window),
+                            AutoUser(args.seed_base, tuple(args.reaction)), person_ax)
+    else:
+        table = KeyboardLevels(viewer.window)
     user = table
     arms = Arms(args.arms, args.arm_seed) if args.arms else None
-    hidden = tuple(AXIS_OF[a] for a in args.helper_axes)
-    hide = ()
+    hide = tuple(i for i in range(3) if i not in person_ax)
     try:
         while (c := next_case()) is not None:
             text = args.texts[c]
@@ -803,13 +876,19 @@ def main() -> None:
                 user, operator = arm_user(sim, levels, args, arm, table)
                 # The axes the person does NOT own go quiet -- no cue, no read-out --
                 # because a read-out of the helper's choices is both a hint and a tell.
-                hide = () if (args.show_arm or arm == "manual") else hidden
+                # What the PERSON owns this episode: their axes, minus the ones a
+                # helper took.  Everything else goes quiet -- a cue for an axis you
+                # cannot set is noise, and a read-out of a helper's choices is a tell.
+                owned = (person_ax if arm == "manual"
+                         else tuple(i for i in person_ax if i not in helper_ax))
+                hide = () if args.show_arm else tuple(i for i in range(3)
+                                                      if i not in owned)
             elif args.auto_user:
                 style, user, operator = tiered(sim, style, seed, levels, args)
             print(f"\n=== case {c} {text!r}  demo {done[c] + 1}/{args.per_case}  (seed {seed})")
             if arms is not None:
-                print("    you set: " + ", ".join(
-                    ("xy", "z", "K_R")[i] for i in range(3) if i not in hide)
+                print("    you set: " + (", ".join(("xy", "z", "K_R")[i] for i in owned)
+                                         or "nothing -- just move the pad")
                     + (f"    [arm {arm}]" if args.show_arm else ""))
             if viewer is not None and not args.auto_next:
                 print("    press G to start")
@@ -825,6 +904,12 @@ def main() -> None:
                 if arms is not None:
                     arms.undo(arm)
                 continue
+            if operator is not None and hasattr(user, "record"):
+                # AFTER the episode.  `record()` taken at arm-selection time reported
+                # calls=0 every time -- reset() had just zeroed it -- so the log could
+                # not answer the first question anyone asks of a blinded session: did
+                # the helper run at all.
+                operator = dict(operator, **user.record())
             keep, path, row = save_episode(
                 sim, rec, res, spec, style, levels, args, text, c, seed,
                 "protocol-human" if args.motion == "human" else
@@ -833,6 +918,7 @@ def main() -> None:
                 operator=operator)
             row["attempt"] = attempt[c]
             row["arm"] = (operator or {}).get("arm")
+            row["calls"] = (operator or {}).get("calls")
             row["motion"] = args.motion
             done[c] += int(keep)
             attempt[c] += 1

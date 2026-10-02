@@ -23,6 +23,7 @@ import numpy as np
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent / "writing"))
 
 LADDERS = dict(xy=(500.0, 1000.0, 3000.0), z=(300.0, 600.0, 1500.0), kr=(0.3, 3.0, 30.0))
 
@@ -147,6 +148,82 @@ def main() -> int:
                              else f"differ on {sum(x != y for x, y in zip(t0, t1))}/8 steps")
     else:
         print("  --    no checkpoints given; pass --ckpt-v0/--ckpt-v1 to pre-flight them")
+
+    # ---- the latched hand ------------------------------------------------------
+    # The state machine a person drives the pad with.  It cannot be tried here (it needs
+    # a window), and it is the thing they fight if it is wrong, so it is checked against
+    # a fake window instead.  The property that matters is the LAST one: a latch holds
+    # after the key is gone, which is the whole reason this hand exists.
+    # interactive.py imports the whole simulator at module level, so the two classes
+    # are taken out of the source, like Arms below.  They need only numpy.
+    i_src = (HERE.parent / "writing" / "interactive.py").read_text()
+    I = type(sys)("I")
+    exec(i_src[i_src.index("class KeyboardHuman:"):i_src.index('CONTROLS = """')],
+         {"np": np}, I.__dict__)
+
+    class FakeWin:
+        shift = False
+
+        def __init__(self):
+            self.queue = []
+
+        def tap(self, *keys):
+            self.queue += list(keys)
+            return self
+
+        def key_press(self, k):
+            if k in self.queue:
+                self.queue.remove(k)
+                return True
+            return False
+
+        def key_down(self, k):
+            return False
+
+    w = FakeWin()
+    hand = I.LatchedHand(w, np.eye(3), [1000.0] * 3)
+    F, N, IDLE = hand.F_PLANE, hand.F_NORMAL, hand.F_IDLE
+
+    def wrench(*keys):
+        w.tap(*keys)
+        return hand.wrench(0.0, np.zeros(3), np.zeros(3), np.zeros(3))[0]
+
+    bad += not check("a tap sets a direction", abs(wrench("l")[0] - F) < 1e-9)
+    bad += not check("the same tap again clears it", abs(wrench("l")[0]) < 1e-9)
+    bad += not check("the opposite tap reverses it", abs(wrench("j")[0] + F) < 1e-9)
+    bad += not check("press is a tap, not a hold",
+                     abs(wrench("u")[2] + N) < 1e-9 and hand.press and not hand.lift)
+    bad += not check("pressing while already sweeping needs no second key down",
+                     abs(wrench("i")[1] - F) < 1e-9 and abs(hand.wrench(
+                         0.0, np.zeros(3), np.zeros(3), np.zeros(3))[0][2] + N) < 1e-9,
+                     "sweep and press are two separate taps, both latched")
+    bad += not check("tapping press again relaxes", abs(wrench("u")[2] - IDLE) < 1e-9)
+    bad += not check("lift is its own latch",
+                     abs(wrench("o")[2] - N) < 1e-9 and hand.lift and not hand.press)
+    bad += not check("F doubles the plane, never the press",
+                     abs(wrench("f", "u")[2] + N) < 1e-9 and hand.fast)
+    bad += not check("X clears everything",
+                     np.allclose(wrench("x"), [0.0, 0.0, IDLE]))
+    f1 = wrench("l")
+    f2 = hand.wrench(0.0, np.zeros(3), np.zeros(3), np.zeros(3))[0]
+    bad += not check("a latch survives the key being gone", np.allclose(f1, f2),
+                     "the one property a held key does not have")
+
+    hold = I.KeyboardHuman(FakeWin(), np.eye(3), [1000.0] * 3)
+    bad += not check("the held hand still answers press/lift from the keys",
+                     hold.press is False and hold.lift is False)
+
+    # ---- SplitLevels: two owners, one triple ----------------------------------
+    src_p = (HERE / "protocol.py").read_text()
+    ns_s = {"np": np, "MID": 1}
+    exec(src_p[src_p.index("class SplitLevels:"):src_p.index("_HELPERS: dict")], ns_s)
+    own, auto = Table([2, 2, 2]), Table([0, 0, 0])
+    sp = ns_s["SplitLevels"](own, auto, (2,))
+    sp.reset()
+    own.level, auto.level = [2, 2, 2], [0, 0, 0]
+    sp.poll(0.0, "contact")
+    bad += not check("the table owns its axes and the person owns theirs",
+                     sp.level == [0, 0, 2], f"{sp.level}")
 
     # ---- the arm schedule ---------------------------------------------------
     src = (HERE / "protocol.py").read_text()

@@ -122,6 +122,20 @@ def main() -> None:
               f"2nd {v[h:].mean():6.3f}  (drift {d:+.3f})")
 
     # ---- 2. the arms -------------------------------------------------------------
+    # `calls` first, because a blinded session hides whether the helper ran and this is
+    # the only place that answers it.  A helper arm at 0 means the arm was a no-op and
+    # its numbers are the manual arm's with extra steps.
+    print("\n  DID IT RUN     helper forward passes per episode (manual is 0 by "
+          "definition)")
+    for a in arms:
+        c = [x.get("calls") for x in rows if x["arm"] == a]
+        c = [v for v in c if v is not None]
+        mean = np.mean(c) if c else float("nan")
+        note = ("" if a == "manual" else
+                "  <- THE HELPER NEVER RAN: this arm is not a helper arm"
+                if not c or mean < 1 else "")
+        print(f"    {a:<7} {mean:8.1f}{note}")
+
     print(f"\n  ARMS           {'n':>3}  " + "  ".join(f"{k:>10}" for k in METRICS)
           + "   | person's axes   K_R")
     for a in arms:

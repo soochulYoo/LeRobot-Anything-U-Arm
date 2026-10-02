@@ -93,6 +93,17 @@ class KeyboardHuman:
         f[2] = self.F_NORMAL * (g * up - down) if (up or down) else self.F_IDLE
         return self.W @ f - self.B @ v_m, self.k.copy()
 
+    # The phase machine in protocol.KeyboardWriter needs to know the same two things
+    # this wrench just used.  It read the keys a second time to get them, which tied it
+    # to THIS hand's key map; as properties, a different hand can answer them its own way.
+    @property
+    def press(self) -> bool:
+        return bool(self.win.key_down("u") and not self.win.key_down("o"))
+
+    @property
+    def lift(self) -> bool:
+        return bool(self.win.key_down("o"))
+
     def stiffness_keys(self) -> bool:
         w, changed = self.win, False
         for key, idx, fac in (("1", (0, 1), 0.8), ("2", (0, 1), 1.25),
@@ -102,6 +113,68 @@ class KeyboardHuman:
                     self.k[i] = float(np.clip(self.k[i] * fac, 100.0, 4000.0))
                 changed = True
         return changed
+
+
+class LatchedHand(KeyboardHuman):
+    """The same hand, with nothing to hold down.
+
+    WHY.  Steering the pad and pressing it into the board are two keys at once, and on
+    this rig they do not reliably coexist -- a held key and a tapped key fight over the
+    window's per-frame key state, so the one thing the job consists of, pressing while
+    sweeping, is the one thing that does not work.  Every key here is a TAP that sets a
+    latch instead, so no two keys ever need to be down at the same instant.
+
+    Tapping a direction again, or its opposite, returns that axis to neutral: a latch
+    you cannot clear is worse than a key you must hold.  X clears everything, which is
+    the key to reach for when the pad is heading somewhere wrong.
+
+    The force this produces is identical to the held version -- the master is driven by
+    a force against damping, so a held key and a latched key both settle at the same
+    terminal speed.  It is the same hand; only the holding is gone.
+    """
+
+    def __init__(self, window, W, k0):
+        super().__init__(window, W, k0)
+        self.dir = [0, 0]        # along u, along v, each in {-1, 0, +1}
+        self.down = 0            # +1 pressing, -1 lifting, 0 neither
+        self.fast = False
+
+    def keys(self) -> None:
+        w = self.win
+        for key, ax, s in (("l", 0, +1), ("j", 0, -1), ("i", 1, +1), ("k", 1, -1)):
+            if w.key_press(key):
+                self.dir[ax] = 0 if self.dir[ax] == s else s
+        if w.key_press("u"):
+            self.down = 0 if self.down == 1 else 1
+        if w.key_press("o"):
+            self.down = 0 if self.down == -1 else -1
+        if w.key_press("f"):
+            self.fast = not self.fast
+        if w.key_press("x"):
+            self.dir, self.down = [0, 0], 0
+
+    def wrench(self, t, x_m, v_m, f_fb):
+        self.keys()
+        g = 2.0 if self.fast else 1.0
+        f = np.zeros(3)                         # in the writing frame (u, v, n)
+        f[0] = g * self.F_PLANE * self.dir[0]
+        f[1] = g * self.F_PLANE * self.dir[1]
+        # The signs are the held version's: +n is away from the board, so pressing is
+        # negative, and with neither latch set a relaxed hand still drifts off (F_IDLE).
+        f[2] = (-self.F_NORMAL if self.down > 0 else
+                g * self.F_NORMAL if self.down < 0 else self.F_IDLE)
+        return self.W @ f - self.B @ v_m, self.k.copy()
+
+    @property
+    def press(self) -> bool:
+        return self.down > 0
+
+    @property
+    def lift(self) -> bool:
+        return self.down < 0
+
+    LATCHED_CONTROLS = ("  I/J/K/L  tap to sweep that way (tap again to stop)   "
+                        "U  press   O  lift\n  F  faster   X  stop everything")
 
 
 CONTROLS = """
