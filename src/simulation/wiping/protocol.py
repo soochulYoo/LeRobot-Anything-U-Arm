@@ -263,13 +263,31 @@ def episode_spec(text: str, case: int, attempt: int, base: int):
     return spec, WT.WiperStyle.sample(seed), seed
 
 
-def tiered(style, seed: int, args):
-    """-> (style, user, operator record) with a scripted tier's two delays applied.
+_HELPER_USER = None            # one per process: torch.load is not cheap
 
-    `--scripted` sets the operator's SEEING delay on the style and the level reaction on
-    the user, which are the two knobs this task already had.  Without it, nothing changes
-    and `--reaction` governs as before.
+
+def tiered(sim, style, seed: int, levels, args):
+    """-> (style, user, operator record): who sets the levels this episode.
+
+    Three sources, and they differ in exactly one thing so that a comparison between them
+    is attributable -- the ramp, the energy tank, the compliance score and the recorder are
+    the same path in all three:
+
+        --scripted TIER   a scripted operator: the protocol's levels, two delays late
+        --helper CKPT     a trained stiffness helper, its continuous K snapped to these
+                          same levels (helper_user.HelperUser)
+        neither           AutoUser on --reaction, as before
     """
+    if getattr(args, "helper", None):
+        global _HELPER_USER
+        if _HELPER_USER is None:
+            import helper_user as HU
+            _HELPER_USER = HU.HelperUser(sim, args.helper, levels,
+                                         AutoUser(seed, tuple(args.reaction)),
+                                         version=args.helper_version or "v1",
+                                         axes=tuple(args.helper_axes))
+        _HELPER_USER.reset()
+        return style, _HELPER_USER, _HELPER_USER.record()
     if not getattr(args, "scripted", None):
         return style, AutoUser(seed, tuple(args.reaction)), None
     style, sk = WS.apply(style, WS.skill(args.scripted), seed)
@@ -329,6 +347,11 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
             rec = sess.step(f_h, k_cmd, kr_cmd)
             rec.update(phase=T.PHASES.index(wr.phase), stroke=wr.k,
                        k_level=np.array(user.level))
+            # A helper sees EXACTLY what the recorder logs -- the same `rec` -- so what it
+            # is given at run time cannot drift from what it was trained on.  Anything
+            # else is a `user` and ignores this.
+            if hasattr(user, "observe"):
+                user.observe(sim.t, rec)
             if recorder is not None:
                 recorder.on_step(i, rec, sess, wr)
             i += 1
@@ -415,7 +438,7 @@ def _run_job(job) -> dict:
     apply_protocol(args)                  # `spawn` re-imported this module
     levels = Levels(xy=tuple(args.k_xy), z=tuple(args.k_z), kr=tuple(args.k_r))
     spec, style, seed = episode_spec(text, c, attempt, args.seed_base)
-    style, user, operator = tiered(style, seed, args)
+    style, user, operator = tiered(_SIM, style, seed, levels, args)
     rec = WipeRecorder(_SIM, images=not args.no_cameras,
                        video_every=2 if attempt < args.video else 0)
     res = run_episode(_SIM, spec, style, user, levels, args, recorder=rec, cues=False)
@@ -451,6 +474,16 @@ def main() -> None:
     ap.add_argument("--keep-failed", action="store_true")
     ap.add_argument("--auto-next", action="store_true")
     ap.add_argument("--auto-user", action="store_true")
+    ap.add_argument("--helper", default=None, metavar="CKPT",
+                    help="a trained stiffness_helper checkpoint sets the levels "
+                         "(helper_user.py).  Implies --auto-user.  Point STIFFNESS_HELPER "
+                         "at that repository if it is not in the default place")
+    ap.add_argument("--helper-version", default=None,
+                    help="what to call it in the logs, e.g. v0 or v1")
+    ap.add_argument("--helper-axes", nargs="+", default=["r"], choices=("t", "n", "r"),
+                    help="which axes the helper owns; the rest keep following the table. "
+                         "Default r alone: that is the axis the tier sweep measured this "
+                         "task to be decided by")
     ap.add_argument("--attempts", type=int, default=None,
                     help="stop a case after this many attempts, kept or not.  A tier "
                          "whose demos mostly FAIL would otherwise never finish: "
@@ -470,8 +503,10 @@ def main() -> None:
     ap.add_argument("--no-cameras", action="store_true")
     ap.add_argument("--image-size", type=int, default=128)
     args = ap.parse_args()
-    if args.scripted:
-        args.auto_user = True        # the tier sets the levels; there is no keyboard
+    if args.scripted or args.helper:
+        args.auto_user = True        # the tier or the helper sets the levels, not a keyboard
+    if args.scripted and args.helper:
+        ap.error("--scripted and --helper both set the levels; pick one")
     if args.headless and not args.auto_user:
         ap.error("--headless needs --auto-user: nobody can press keys without a window")
     if (args.workers > 1 or args.video) and not args.headless:
@@ -555,7 +590,7 @@ def main() -> None:
             spec, style, seed = episode_spec(text, c, attempt[c], args.seed_base)
             operator = None
             if args.auto_user:
-                style, user, operator = tiered(style, seed, args)
+                style, user, operator = tiered(sim, style, seed, levels, args)
             print(f"\n=== case {c} {text!r}  demo {done[c] + 1}/{args.per_case}  (seed {seed})")
             if viewer is not None and not args.auto_next:
                 print("    press G to start")
