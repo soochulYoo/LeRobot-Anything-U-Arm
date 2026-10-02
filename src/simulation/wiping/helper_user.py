@@ -40,9 +40,35 @@ import sys
 import numpy as np
 
 _DEFAULT = "/scratch2/soochul/TeleopHelper"
-_SH = os.environ.get("STIFFNESS_HELPER", _DEFAULT)
+
+
+def _find_helper_repo() -> str:
+    """Where `stiffness_helper` lives, in order: $STIFFNESS_HELPER, an ancestor of this
+    file, then one machine's path.
+
+    The ancestor search is the one that matters.  That repository reaches this simulator
+    as a SUBMODULE of itself -- external/lerobot-uarm/src/simulation/wiping is where this
+    file then sits -- so walking up from here finds it with no configuration at all, on
+    any machine and under any clone name.  Without it, running anything in this directory
+    by hand (the pre-flight test, most of all) only worked on the machine _DEFAULT names,
+    and failed as a bare ModuleNotFoundError that says nothing about what to set.
+    """
+    env = os.environ.get("STIFFNESS_HELPER")
+    if env:
+        return env
+    for up in pathlib.Path(__file__).resolve().parents:
+        if (up / "stiffness_helper" / "__init__.py").exists():
+            return str(up)
+    return _DEFAULT
+
+
+_SH = _find_helper_repo()
 if _SH not in sys.path:
     sys.path.insert(0, _SH)
+if not (pathlib.Path(_SH) / "stiffness_helper" / "__init__.py").exists():
+    print(f"[helper_user] no `stiffness_helper` package at {_SH}.\n"
+          f"              set STIFFNESS_HELPER=/path/to/the/stiffness-helper/checkout",
+          file=sys.stderr)
 
 
 def _np(x):
