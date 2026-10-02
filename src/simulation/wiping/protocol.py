@@ -312,6 +312,57 @@ def episode_spec(text: str, case: int, attempt: int, base: int):
 AXIS_OF = {"t": 0, "n": 1, "r": 2}        # --helper-axes -> this file's (xy, z, K_R)
 
 
+class Console:
+    """--console: this process driven by `stiffness_helper.console`, over a pipe.
+
+    It is a SECOND source of the three keys the operator already has -- G to start, R to
+    finish, N to abort -- and a telemetry tap.  The keyboard keeps working: a person at
+    the rig should not lose control of the arm because a browser tab was closed, and
+    during a demo the window is where their hands already are.
+
+    Telemetry goes out at the rate the terminal line already updates, 2 Hz, and camera
+    frames at 2 Hz: a screen refresh, not a control rate.  Nothing here may block -- a
+    loop holding an impedance cannot wait for a reader -- which is why the commands
+    arrive through a queue a thread fills.
+    """
+
+    def __init__(self):
+        from stiffness_helper.console import wire
+        self.w = wire
+        self.cmds = wire.Commands()
+        wire.emit("ready", task="wiping", keys="G start / R done / N pass",
+                  note="the keyboard still works; the console is a second source")
+
+    def poll(self):
+        m = self.cmds.poll()
+        return m["cmd"] if m else None
+
+    def tel(self, sim, user, k_cmd, kr_cmd, rtf):
+        f = np.asarray(sim.last["f_filt"], float)
+        fn = float(sim.last["f_sensor_n"])
+        ft = float(max(0.0, float(np.linalg.norm(f)) ** 2 - fn ** 2) ** 0.5)
+        self.w.emit("tel", t=round(float(sim.t), 3),
+                    f_n=round(float(sim.last["f_n"]), 3), f_t=round(ft, 3),
+                    lvl=[int(v) for v in user.level],
+                    k=[float(k_cmd[0]), float(k_cmd[2]), float(kr_cmd)],
+                    rtf=round(float(rtf), 2), left=int((~sim.gone).sum()))
+
+    def frame(self, sim):
+        try:
+            img = sim.observe(images=True)["rgb_top_camera"]
+            a = np.asarray(img.cpu() if hasattr(img, "cpu") else img)
+            while a.ndim > 3:
+                a = a[0]
+            j = self.w.jpeg(a)
+            if j:
+                self.w.emit("frame", cam="top", jpg=j)
+        except Exception as e:                                 # noqa: BLE001
+            self.w.emit("log", msg=f"[console] no frame: {type(e).__name__}: {e}")
+
+    def episode(self, row):
+        self.w.emit("episode", row=row)
+
+
 class Arms:
     """Which arm the next episode runs.  Balanced shuffled blocks: every arm appears
     once per block and the order inside a block is random, so any prefix of the session
@@ -506,6 +557,8 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
     # arm would be scored on the lag and not on the stiffness.  The loop already catches
     # up to 0.1 s per frame and silently falls behind past that, so it has to say so.
     t_wall0, t_sim0 = time.time(), sim.t
+    con = getattr(args, "_console", None)
+    last_frame, aborted = -1e9, False
     while not wr.done and sim.t < spec.time_limit:
         n_steps = 1
         if viewer is not None:
@@ -518,6 +571,17 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
             if human and w.key_press("r"):
                 print("\n[finished by hand]")
                 wr.done = True
+        if con is not None:
+            c = con.poll()
+            if c == "done":
+                print("\n[finished from the console]")
+                wr.done = True
+            elif c == "pass":
+                print("\n[passed from the console]")
+                aborted = True
+                break
+            elif c == "stop":
+                raise KeyboardInterrupt
             now = time.time()
             acc += min(now - last, 0.1)
             last = now
@@ -554,13 +618,21 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
                 break
         if viewer is not None:
             sim.env.render_human()
-            if sim.t - last_print > 0.5:
-                last_print = sim.t
-                rtf = (sim.t - t_sim0) / max(1e-6, time.time() - t_wall0)
+        if sim.t - last_print > 0.5:
+            last_print = sim.t
+            rtf = (sim.t - t_sim0) / max(1e-6, time.time() - t_wall0)
+            if viewer is not None:
                 print(f"\r   t {sim.t:5.1f}s  {lv_str(user.level)}"
                       f"  board {sim.last['f_n']:4.1f} N  left {(~sim.gone).sum():3d}"
                       f"  {rtf:4.2f}x{' LAGGING' if rtf < 0.9 else '        '}",
                       end="", flush=True)
+            if con is not None:
+                con.tel(sim, user, k_cmd, kr_cmd, rtf)
+                if sim.t - last_frame > 0.5:
+                    last_frame = sim.t
+                    con.frame(sim)
+    if aborted:
+        return None
     res = sim.score()
     res["finished"] = bool(wr.done)
     if not wr.done:
@@ -696,6 +768,9 @@ def main() -> None:
     ap.add_argument("--motion", choices=("wiper", "human"), default="wiper",
                     help="who moves the pad: the synthetic wiper, or a person on "
                          "IJKL/U/O (writing/protocol.py's KeyboardWriter; R ends it)")
+    ap.add_argument("--console", action="store_true",
+                    help="driven by stiffness_helper.console over the pipe: telemetry "
+                         "out, COLLECT/DONE/PASS in, alongside the keyboard")
     ap.add_argument("--keys", choices=("latch", "hold"), default="latch",
                     help="--motion human: `latch` taps to set a direction and needs no "
                          "two keys at once; `hold` is the original held-key hand")
@@ -758,6 +833,8 @@ def main() -> None:
         ap.error(f"--auto-axes takes {' '.join(AXIS_OF)} or none")
     if args.motion == "human" and args.headless:
         ap.error("--motion human needs a window: nobody can press keys without one")
+    if args.console and args.workers > 1:
+        ap.error("--console drives one episode at a time; --workers is for a batch")
     if args.headless and not args.auto_user:
         ap.error("--headless needs --auto-user: nobody can press keys without a window")
     if (args.workers > 1 or args.video) and not args.headless:
@@ -851,6 +928,11 @@ def main() -> None:
                   f" (schedule seed {args.arm_seed})")
         print()
 
+    # The console is built AFTER the simulator, so a scene that fails to load is a plain
+    # traceback on stderr and not a half-open pipe the console has to time out.
+    con = Console() if args.console else None
+    args._console = con
+
     auto_ax = () if args.auto_axes == ["none"] else tuple(AXIS_OF[a] for a in args.auto_axes)
     person_ax = tuple(i for i in range(3) if i not in auto_ax)
     helper_ax = tuple(AXIS_OF[a] for a in args.helper_axes)
@@ -890,19 +972,40 @@ def main() -> None:
                 print("    you set: " + (", ".join(("xy", "z", "K_R")[i] for i in owned)
                                          or "nothing -- just move the pad")
                     + (f"    [arm {arm}]" if args.show_arm else ""))
-            if viewer is not None and not args.auto_next:
-                print("    press G to start")
+            if (viewer is not None or args.console) and not args.auto_next:
+                print("    press G to start" + ("  (or COLLECT in the console)"
+                                                if args.console else ""))
                 sim.reset(spec)
-                while not viewer.window.key_press("g"):
-                    if viewer.window.should_close or viewer.window.key_down("esc"):
-                        raise KeyboardInterrupt
-                    sim.env.render_human()
+                while True:
+                    if viewer is not None:
+                        if viewer.window.key_press("g"):
+                            break
+                        if viewer.window.should_close or viewer.window.key_down("esc"):
+                            raise KeyboardInterrupt
+                        sim.env.render_human()
+                    if args.console:
+                        c = con.poll()
+                        if c == "collect":
+                            break
+                        if c == "stop":
+                            raise KeyboardInterrupt
+                    if viewer is None:
+                        time.sleep(0.02)
             rec = WipeRecorder(sim, images=not args.no_cameras)
             res = run_episode(sim, spec, style, user, levels, args, recorder=rec,
                               viewer=viewer, cues=viewer is not None, hide=hide)
             if res is None:
                 if arms is not None:
                     arms.undo(arm)
+                if args.console:
+                    # A DISCARDED EPISODE IS STILL AN EVENT.  Both N and the console's
+                    # PASS land here, and without this the console would sit in
+                    # "recording" for the rest of the session waiting for an episode
+                    # that was thrown away.
+                    con.episode(dict(case=c, text=text, board=args.board, seed=seed,
+                                     attempt=attempt[c], kept=False, success=False,
+                                     reason="passed", arm=(operator or {}).get("arm"),
+                                     motion=args.motion))
                 continue
             if operator is not None and hasattr(user, "record"):
                 # AFTER the episode.  `record()` taken at arm-selection time reported
@@ -923,6 +1026,11 @@ def main() -> None:
             done[c] += int(keep)
             attempt[c] += 1
             log(row)
+            if args.console:
+                # AFTER save_episode: the console's loop advances on this event, so it
+                # must not arrive before the file it refers to exists on disk.
+                con.episode(dict(row, compliance=row["compliance"]["overall"],
+                                 kept=bool(keep)))
             print("\n" + verdict_line(row, done[c], args.per_case))
     except KeyboardInterrupt:
         print("\n[quit] episode in progress discarded")
