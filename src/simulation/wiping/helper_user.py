@@ -51,11 +51,25 @@ def _np(x):
 
 
 class HelperUser:
-    """Levels from a checkpoint.  Construct one per episode, or call `reset()`."""
+    """Levels from a helper.  Construct one per episode, or call `reset()`.
+
+    `ckpt=None` with `version="v0"` is the RULE, loaded through the same `LevelHelper`
+    as a checkpoint so this file needs no branch on the version.  It is the cold start --
+    the version that exists before any data does -- and it is NOT what `--arms v0` means
+    by default: v0 there is the model trained on the tier demos, `--ckpt-v0`.  Be aware
+    of what the rule reduces to on THIS rig before using it as a bar: SAPIEN's
+    `get_pairwise_contact_forces` returns a force and no moment, so the moment channel
+    is zeros, and v0's rotational rule -- |m| / theta_ok, the one rule that reads the
+    pad's tilt -- pins to the bottom of the K_R range the moment contact begins.  With
+    `--helper-axes r` a v0 arm is therefore close to a CONSTANT: K_R mid in the air,
+    low once down.  That is not a crippled baseline, it is the honest first version on a
+    rig whose sensor gives force only, and it is the bar v1 has to clear; but it is a
+    constant, so do not report it as a rule that reacts.
+    """
 
     AXES = {"t": 0, "n": 1, "r": 2}
 
-    def __init__(self, sim, ckpt: str, levels, table, version: str = "v1",
+    def __init__(self, sim, ckpt: str | None, levels, table, version: str = "v1",
                  hz: float = 10.0, axes=("r",)):
         from stiffness_helper.adapters.wiping import WIPING_KSPEC
         from stiffness_helper.deploy import LevelHelper, downsample
@@ -64,7 +78,8 @@ class HelperUser:
         self.helper = LevelHelper(ckpt, kspec=WIPING_KSPEC, hz=hz, version=version,
                                  ladders=(tuple(levels.xy), tuple(levels.z),
                                           tuple(levels.kr)))
-        self.ckpt, self.version, self.hz = str(ckpt), version, hz
+        self.ckpt = None if ckpt is None else str(ckpt)
+        self.version, self.hz = self.helper.version, hz
         self.axes = tuple(self.AXES[a] for a in axes)
         # THE AXES THE HELPER DOES NOT OWN KEEP FOLLOWING THE TABLE.  Only the rotational
         # axis is the helper's by default, because that is the axis the tier sweep measured

@@ -61,6 +61,21 @@ Keys (SAPIEN's viewer owns WASD/QE for its camera):
 Usage:
     python3 protocol.py --board curved --texts S 7 --per-case 50 --auto-user \
                         --headless --workers 12 --out demos/wipe_curved
+
+A PERSON STEERING, WITH A HELPER ON K_R -- the session this was built for:
+
+    python3 protocol.py --board curved --texts S --per-case 9 --motion human \
+            --arms manual v0 v1 --keep-failed --min-compliance 0 \
+            --ckpt-v0 runs/w40_v0/model.pt --ckpt-v1 runs/w40_v1/model.pt \
+            --time-limit 180 --out demos/human
+
+    IJKL  slide the pad        U  press down      O  lift        SHIFT  faster
+    R     this demo is finished (nothing else ends a hand-driven episode)
+
+  The arm is drawn from balanced shuffled blocks and is NOT announced.  What the
+  blind can and cannot cover is in `Arms`: v0 against v1 is blind, manual against
+  the two is not, because a person obviously knows whether they are pressing the
+  K_R keys themselves.
     python3 protocol.py --board flat --texts S --per-case 4 --auto-user --headless \
                         --out demos/smoke --video 2
 
@@ -187,12 +202,43 @@ class AutoUser(WP.AutoUser):
 
 
 class Compliance(WP.Compliance):
+    """The inherited score, against THIS module's table, plus a PER-AXIS breakdown.
+
+    (The step override is not redundant: `EXPECTED` resolves in the module a method was
+    defined in, so the inherited one would score against writing's two-axis table.)
+
+    Why the breakdown.  `overall` requires all three axes to match at the same instant,
+    so in an arm where a helper owns K_R it scores the helper and the person TOGETHER and
+    is not comparable across arms -- and `save_episode` filters on it, which is why
+    --arms refuses a non-zero --min-compliance.  Per axis, `axis_xy` and `axis_z` are the
+    person's own work in every arm, so they are comparable; `axis_kr` is whoever owned
+    K_R that episode.  The mechanism a helper arm claims is precisely that the first two
+    go UP once K_R is off the person's hands, and that claim needs its own column: an
+    outcome that improves tells you the demo got better, not that attention moved.
+    """
+
+    AX = ("xy", "z", "kr")
+
+    def __init__(self, grace: float):
+        super().__init__(grace)
+        self.ax_hit = {a: 0 for a in self.AX}
+        self.ax_n = 0
+
     def step(self, t: float, group: str, level) -> None:
         if group != self.group:
             self.group, self.t_change = group, t
         if t - self.t_change >= self.grace:
             self.n[group] += 1
             self.hit[group] += int(tuple(level) == EXPECTED[group])
+            self.ax_n += 1
+            for i, a in enumerate(self.AX):
+                self.ax_hit[a] += int(level[i] == EXPECTED[group][i])
+
+    def summary(self) -> dict:
+        s = super().summary()
+        for a in self.AX:
+            s[f"axis_{a}"] = (self.ax_hit[a] / self.ax_n if self.ax_n else float("nan"))
+        return s
 
 
 # --------------------------------------------------------------------------- #
@@ -263,6 +309,86 @@ def episode_spec(text: str, case: int, attempt: int, base: int):
     return spec, WT.WiperStyle.sample(seed), seed
 
 
+AXIS_OF = {"t": 0, "n": 1, "r": 2}        # --helper-axes -> this file's (xy, z, K_R)
+
+
+class Arms:
+    """Which arm the next episode runs.  Balanced shuffled blocks: every arm appears
+    once per block and the order inside a block is random, so any prefix of the session
+    is near-balanced and the operator cannot predict what comes next.
+
+    WHY NOT JUST RUN ALL OF v0 THEN ALL OF v1.  A person's hand gets better over a
+    session -- it is the premise of the whole project that practice moves demo quality --
+    so a blocked order charges the operator's own learning curve to whichever arm ran
+    last.  Interleaving is the only way the arm difference survives it.
+
+    WHAT THE BLIND COVERS, AND WHAT IT CANNOT.  v0 against v1 is blind: in both the
+    person owns xy and z, does the identical job, and never sees what K_R is doing, so
+    nothing but the robot's behaviour distinguishes them.  Manual against the two is NOT
+    blind and cannot be -- the operator plainly knows whether they are pressing the K_R
+    keys themselves, and hiding it would mean asking them to choose K_R with no cue and
+    no read-out, which is not a baseline, it is sabotage.  So the terminal says which
+    axes the person owns this episode and never which helper is behind the ones they do
+    not.  --show-arm turns the blind off for a rehearsal run.
+    """
+
+    def __init__(self, arms, seed: int):
+        self.arms = list(arms)
+        self.rng = np.random.default_rng(seed)
+        self.queue: list[str] = []
+
+    def next(self) -> str:
+        if not self.queue:
+            self.queue = [str(a) for a in self.rng.permutation(self.arms)]
+        return self.queue.pop()
+
+    def undo(self, arm: str) -> None:
+        """Give an arm back: an episode the operator ABORTED never happened.
+
+        Without this an abort silently eats one arm out of its block -- the block ends
+        short, the balance the whole design rests on is gone, and nothing says so.  The
+        randomization is retried too (`attempt` does not advance on an abort), so the
+        arm has to come back with it.
+        """
+        self.queue.append(arm)
+
+
+_HELPERS: dict = {}           # arm -> HelperUser: torch.load is not cheap
+
+
+def arm_user(sim, levels, args, arm: str, table):
+    """-> (user, operator record) for one arm of a human session.
+
+    The arms differ in exactly ONE thing: who sets the axes named by --helper-axes.
+    The table the other axes follow, the ramp, the energy tank, the compliance score and
+    the recorder are the same objects in every arm, so a difference between arms is
+    attributable to the helper and not to the path around it.
+
+    `table` -- the operator's keyboard -- is SHARED across arms on purpose.  In a helper
+    arm the person still owns the axes the helper does not, which is what a helper is
+    for: it removes one of three things to think about, not all three.  Handing the
+    helper arms their own table instead would have reset the person's xy/z choices on
+    every arm change.
+    """
+    if arm == "manual":
+        return table, dict(skill="human", arm=arm, axes=[])
+    if arm not in _HELPERS:
+        import helper_user as HU
+        # BOTH generations are checkpoints: v0 is the model trained on the tier demos and
+        # v1 the model trained on what v0's own sessions produced, relabeled.  That is the
+        # loop this experiment is about, so a v0 arm must load v0's weights.  --ckpt-v0 is
+        # nonetheless optional: with it omitted v0 falls back to the RULE, which is the
+        # genuine cold start -- the version that exists before any data does -- and the
+        # two are not interchangeable.  See helper_user.HelperUser on what the rule
+        # reduces to on this rig.
+        ckpt = args.ckpt_v0 if arm == "v0" else args.ckpt_v1
+        _HELPERS[arm] = HU.HelperUser(sim, ckpt, levels, table, version=arm,
+                                      axes=tuple(args.helper_axes))
+    u = _HELPERS[arm]
+    u.reset()
+    return u, dict(u.record(), arm=arm)
+
+
 _HELPER_USER = None            # one per process: torch.load is not cheap
 
 
@@ -298,13 +424,31 @@ def tiered(sim, style, seed: int, levels, args):
 
 
 def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
-                viewer=None, cues: bool = True) -> dict | None:
-    """One autonomous episode with levels from `user`."""
+                viewer=None, cues: bool = True, hide=()) -> dict | None:
+    """One episode with levels from `user`.  `hide` is the axes whose cue and read-out
+    are suppressed, because the person does not own them this episode (see `Arms`)."""
     sim.reset(spec)
     sess = T.TeleopSession(sim)
-    wr = WT.SyntheticWiper(sim, dataclasses.replace(style, hover_dwell=args.dwell,
-                                                    v_desc=args.v_desc,
-                                                    v_travel=args.v_travel))
+    # --motion human puts a PERSON where the synthetic wiper was.  writing/protocol.py's
+    # KeyboardWriter drops in unchanged: WipingSim subclasses WritingSim, so it has the
+    # W frame, K0, target.strokes and the pen_down flag that class reads, and the loop
+    # below already calls exactly the attributes it offers.  Nobody plans the strokes
+    # now, so `wr.phase` is read off the hand and only R ends the episode.
+    human = getattr(args, "motion", "wiper") == "human"
+    if human:
+        if viewer is None:
+            raise RuntimeError("--motion human needs a window")
+        wr = WP.KeyboardWriter(viewer.window, sim)
+    else:
+        wr = WT.SyntheticWiper(sim, dataclasses.replace(style, hover_dwell=args.dwell,
+                                                        v_desc=args.v_desc,
+                                                        v_travel=args.v_travel))
+    shown = [i for i in range(3) if i not in tuple(hide)]
+    names = ("xy", "z", "K_R")
+
+    def lv_str(lv, w=4):
+        return "  ".join(f"{names[i]} {LEVEL_NAMES[lv[i]]:<{w}}" for i in shown)
+
     user.reset()
     comp = Compliance(args.grace)
     k_cmd = levels.k(user.level)
@@ -313,6 +457,12 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
     i = 0
     last_group = None
     last, acc, last_print = time.time(), 0.0, -1.0
+    # REAL-TIME FACTOR, shown to the operator.  A helper arm renders two cameras and runs
+    # a forward pass ten times a second on top of the viewer, and if that does not fit in
+    # wall time the pad answers the keys late -- which a person compensates for, so the
+    # arm would be scored on the lag and not on the stiffness.  The loop already catches
+    # up to 0.1 s per frame and silently falls behind past that, so it has to say so.
+    t_wall0, t_sim0 = time.time(), sim.t
     while not wr.done and sim.t < spec.time_limit:
         n_steps = 1
         if viewer is not None:
@@ -322,6 +472,9 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
             if w.key_press("n"):
                 print("\n[aborted] same randomization again")
                 return None
+            if human and w.key_press("r"):
+                print("\n[finished by hand]")
+                wr.done = True
             now = time.time()
             acc += min(now - last, 0.1)
             last = now
@@ -329,14 +482,13 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
             acc -= n_steps * dt
         for _ in range(n_steps):
             group = WP.group_of(wr)
-            if user.poll(sim.t, group) and viewer is not None:
-                print(f"\n    xy {LEVEL_NAMES[user.level[0]]:<4} z {LEVEL_NAMES[user.level[1]]:<4}"
-                      f" K_R {LEVEL_NAMES[user.level[2]]:<4}")
+            if user.poll(sim.t, group) and viewer is not None and shown:
+                print(f"\n    {lv_str(user.level)}")
             if cues and group != last_group:
                 want = EXPECTED[group]
+                cue = ", ".join(f"{names[i]} {LEVEL_NAMES[want[i]]}" for i in shown)
                 print(f"\n  [{sim.t:5.1f}s] row {min(wr.k + 1, len(wr.strokes))}/{len(wr.strokes)} "
-                      f"{group.upper():<13} -> xy {LEVEL_NAMES[want[0]]}, z {LEVEL_NAMES[want[1]]},"
-                      f" K_R {LEVEL_NAMES[want[2]]}")
+                      f"{group.upper():<13}" + (f" -> {cue}" if cue else ""))
             last_group = group
             f_h, _ = wr.act(sim.t, sess.x_m, sess.v_m, sess.f_fb, sim.last["p"])
             # the level change ramps, like a muscle; the tank pays for both
@@ -361,9 +513,10 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
             sim.env.render_human()
             if sim.t - last_print > 0.5:
                 last_print = sim.t
-                print(f"\r   t {sim.t:5.1f}s  xy {LEVEL_NAMES[user.level[0]]:<4}"
-                      f" z {LEVEL_NAMES[user.level[1]]:<4} K_R {LEVEL_NAMES[user.level[2]]:<4}"
-                      f"  board {sim.last['f_n']:4.1f} N  left {(~sim.gone).sum():3d}   ",
+                rtf = (sim.t - t_sim0) / max(1e-6, time.time() - t_wall0)
+                print(f"\r   t {sim.t:5.1f}s  {lv_str(user.level)}"
+                      f"  board {sim.last['f_n']:4.1f} N  left {(~sim.gone).sum():3d}"
+                      f"  {rtf:4.2f}x{' LAGGING' if rtf < 0.9 else '        '}",
                       end="", flush=True)
     res = sim.score()
     res["finished"] = bool(wr.done)
@@ -497,6 +650,26 @@ def main() -> None:
                          "in their `operator` attribute")
     ap.add_argument("--reaction", type=float, nargs=2, default=[0.20, 0.45],
                     metavar=("MIN", "MAX"))
+    ap.add_argument("--motion", choices=("wiper", "human"), default="wiper",
+                    help="who moves the pad: the synthetic wiper, or a person on "
+                         "IJKL/U/O (writing/protocol.py's KeyboardWriter; R ends it)")
+    ap.add_argument("--arms", nargs="+", default=None,
+                    choices=("manual", "v0", "v1"),
+                    help="interleave these arms, one draw per episode, not announced: "
+                         "manual = the person sets every axis, v0/v1 = a helper owns "
+                         "--helper-axes and the person owns the rest")
+    ap.add_argument("--ckpt-v0", default=None, metavar="CKPT",
+                    help="the v0 checkpoint for --arms: the model trained on the tier "
+                         "demos.  Omit it to run v0 as the RULE instead -- the cold "
+                         "start, which on this rig is close to a constant K_R")
+    ap.add_argument("--ckpt-v1", default=None, metavar="CKPT",
+                    help="the v1 checkpoint for --arms: trained on what v0 collected")
+    ap.add_argument("--arm-seed", type=int, default=0,
+                    help="the arm schedule, so a session is reproducible and auditable")
+    ap.add_argument("--show-arm", action="store_true",
+                    help="announce the arm: for a rehearsal, never for a real session")
+    ap.add_argument("--time-limit", type=float, default=None,
+                    help="override the spec's 90 s; a hand is slower than the wiper")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--video", type=int, default=0)
@@ -507,6 +680,29 @@ def main() -> None:
         args.auto_user = True        # the tier or the helper sets the levels, not a keyboard
     if args.scripted and args.helper:
         ap.error("--scripted and --helper both set the levels; pick one")
+    if args.arms:
+        if args.auto_user or args.scripted or args.helper:
+            ap.error("--arms chooses who sets the levels; drop --auto-user/--scripted/--helper")
+        if args.headless:
+            ap.error("--arms is a human session: it needs a window")
+        if "v1" in args.arms and not args.ckpt_v1:
+            ap.error("--arms v1 needs --ckpt-v1")
+        if "v0" in args.arms and not args.ckpt_v0:
+            print("  [arms] no --ckpt-v0: v0 runs as the RULE, not the first-generation "
+                  "model.  On this rig that is close to a constant K_R (the F/T reading "
+                  "carries no moment), so it is a cold-start bar, not a v0-vs-v1 "
+                  "comparison.  Pass --ckpt-v0 runs/w40_v0/model.pt for that.")
+        if len(set(args.arms)) < 2:
+            ap.error("--arms wants at least two arms to compare")
+        if args.min_compliance > 0 or not args.keep_failed:
+            ap.error("--arms needs --min-compliance 0 --keep-failed.  Compliance scores "
+                     "the axes the HELPER owns too, so keeping only compliant episodes "
+                     "drops them by an arm-dependent rule -- the helper arms would be "
+                     "filtered on the helper's own output and the comparison would be "
+                     "biased before it started.  Filter afterwards, in the report.")
+        args.arms = sorted(set(args.arms))
+    if args.motion == "human" and args.headless:
+        ap.error("--motion human needs a window: nobody can press keys without one")
     if args.headless and not args.auto_user:
         ap.error("--headless needs --auto-user: nobody can press keys without a window")
     if (args.workers > 1 or args.video) and not args.headless:
@@ -581,17 +777,40 @@ def main() -> None:
 
     if viewer is not None:
         print(__doc__.split("Usage:")[0].split("THE PROTOCOL")[1].split("A level change")[0])
-        print("  keys    xy 1/2/3   z 8/9/0   K_R 4/5/6   M all mid   G go   N abort   ESC quit\n")
+        print("  keys    xy 1/2/3   z 8/9/0   K_R 4/5/6   M all mid   G go   N abort   ESC quit")
+        if args.motion == "human":
+            print("  hand    IJKL slide   U press   O lift   SHIFT faster   R demo finished")
+        if args.arms:
+            print(f"  arms    {' '.join(args.arms)}  interleaved, "
+                  f"{'ANNOUNCED' if args.show_arm else 'not announced'}"
+                  f" (schedule seed {args.arm_seed})")
+        print()
 
-    user = None if args.auto_user else KeyboardLevels(viewer.window)
+    table = None if args.auto_user else KeyboardLevels(viewer.window)
+    user = table
+    arms = Arms(args.arms, args.arm_seed) if args.arms else None
+    hidden = tuple(AXIS_OF[a] for a in args.helper_axes)
+    hide = ()
     try:
         while (c := next_case()) is not None:
             text = args.texts[c]
             spec, style, seed = episode_spec(text, c, attempt[c], args.seed_base)
+            if args.time_limit:
+                spec = dataclasses.replace(spec, time_limit=args.time_limit)
             operator = None
-            if args.auto_user:
+            if arms is not None:
+                arm = arms.next()
+                user, operator = arm_user(sim, levels, args, arm, table)
+                # The axes the person does NOT own go quiet -- no cue, no read-out --
+                # because a read-out of the helper's choices is both a hint and a tell.
+                hide = () if (args.show_arm or arm == "manual") else hidden
+            elif args.auto_user:
                 style, user, operator = tiered(sim, style, seed, levels, args)
             print(f"\n=== case {c} {text!r}  demo {done[c] + 1}/{args.per_case}  (seed {seed})")
+            if arms is not None:
+                print("    you set: " + ", ".join(
+                    ("xy", "z", "K_R")[i] for i in range(3) if i not in hide)
+                    + (f"    [arm {arm}]" if args.show_arm else ""))
             if viewer is not None and not args.auto_next:
                 print("    press G to start")
                 sim.reset(spec)
@@ -601,15 +820,20 @@ def main() -> None:
                     sim.env.render_human()
             rec = WipeRecorder(sim, images=not args.no_cameras)
             res = run_episode(sim, spec, style, user, levels, args, recorder=rec,
-                              viewer=viewer, cues=viewer is not None)
+                              viewer=viewer, cues=viewer is not None, hide=hide)
             if res is None:
+                if arms is not None:
+                    arms.undo(arm)
                 continue
             keep, path, row = save_episode(
                 sim, rec, res, spec, style, levels, args, text, c, seed,
+                "protocol-human" if args.motion == "human" else
                 "protocol-scripted" if operator else
                 ("protocol-auto" if args.auto_user else "protocol-keyboard"), out,
                 operator=operator)
             row["attempt"] = attempt[c]
+            row["arm"] = (operator or {}).get("arm")
+            row["motion"] = args.motion
             done[c] += int(keep)
             attempt[c] += 1
             log(row)
