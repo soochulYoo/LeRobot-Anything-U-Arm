@@ -544,6 +544,51 @@ class SplitLevels:
         return changed
 
 
+def make_table(args, viewer, person_ax):
+    """Who sets the levels when no helper is driving them.
+
+    ALWAYS A SplitLevels WHEN A PERSON IS AT THE CONTROLS, even when they own every
+    axis.  Keying this off `auto_ax` meant that in the one configuration where the
+    person owns all three -- which is the VR default, because two thumbsticks carry
+    three axes without a key -- the table was a bare KeyboardLevels with no `.own`, and
+    the thumbstick writes went nowhere.  Silently.  SplitLevels with every axis on the
+    keyboard side is the same thing with a half nobody has to special-case.
+    """
+    if args.auto_user:
+        return None
+    if viewer is None:
+        return None
+    return SplitLevels(KeyboardLevels(viewer.window),
+                       AutoUser(args.seed_base, tuple(args.reaction)), person_ax)
+
+
+def helper_table(args, seed: int, levels):
+    """What a helper's non-owned axes follow: the protocol table, plus the person's own
+    keys when a person is there to press them."""
+    auto = AutoUser(seed, tuple(args.reaction))
+    view = getattr(args, "_viewer", None)
+    if view is None or getattr(args, "motion", "wiper") == "wiper":
+        return auto
+    person = getattr(args, "_person_ax", (0, 1, 2))
+    return SplitLevels(KeyboardLevels(view.window), auto, person)
+
+
+def human_levels(user):
+    """The object a person's own stiffness choice writes into, whatever the arrangement.
+
+    A helper wraps a table; that table keeps the keyboard half as `.own`.  Returning
+    None means a press or a stick push lands nowhere, which is what it did.
+    """
+    cur, seen = user, set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        own = getattr(cur, "own", None)
+        if own is not None:
+            return own
+        cur = getattr(cur, "_table", None)
+    return None
+
+
 _HELPERS: dict = {}           # arm -> HelperUser: torch.load is not cheap
 
 
@@ -600,8 +645,12 @@ def tiered(sim, style, seed: int, levels, args):
         global _HELPER_USER
         if _HELPER_USER is None:
             import helper_user as HU
+            # The table the helper wraps keeps a KEYBOARD HALF whenever a person is
+            # at the controls, so they can take an axis back from it.  Without one the
+            # helper owns its axes outright, a press or a stick push has nowhere to go,
+            # and the takeover record this loop is built on can never fire.
             _HELPER_USER = HU.HelperUser(sim, args.helper, levels,
-                                         AutoUser(seed, tuple(args.reaction)),
+                                         helper_table(args, seed, levels),
                                          version=args.helper_version or "v1",
                                          axes=tuple(args.helper_axes))
         _HELPER_USER.reset()
@@ -694,10 +743,13 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
             # -- the keyboard half of the table -- so a helper arm reads it as a
             # takeover exactly as it reads key 4/5/6.  Relative rather than absolute
             # because a stick springs back to centre; see vr.StickLevels.
-            own = getattr(getattr(user, "_table", user), "own", None)
-            if own is not None:
-                for ax, sign in vr.levels():
-                    own.level[ax] = int(np.clip(own.level[ax] + sign, 0, 2))
+            own = human_levels(user)
+            for ax, sign in vr.levels():
+                if own is None:
+                    con.w.emit("log", msg="[vr] a stick push had nowhere to go -- "
+                                          "no human level source in this arrangement")
+                    break
+                own.level[ax] = int(np.clip(own.level[ax] + sign, 0, 2))
         if con is not None:
             cmd = con.poll()
             if cmd == "done":
@@ -1067,6 +1119,7 @@ def main() -> None:
     auto_ax = () if args.auto_axes == ["none"] else tuple(AXIS_OF[a] for a in args.auto_axes)
     person_ax = tuple(i for i in range(3) if i not in auto_ax)
     helper_ax = tuple(AXIS_OF[a] for a in args.helper_axes)
+    args._person_ax = person_ax
 
     if viewer is not None:
         print(__doc__.split("Usage:")[0].split("THE PROTOCOL")[1].split("A level change")[0])
@@ -1093,14 +1146,9 @@ def main() -> None:
     # traceback on stderr and not a half-open pipe the console has to time out.
     con = Console(sim) if args.console else None
     args._console = con
+    args._viewer = viewer
 
-    if args.auto_user:
-        table = None
-    elif auto_ax:
-        table = SplitLevels(KeyboardLevels(viewer.window),
-                            AutoUser(args.seed_base, tuple(args.reaction)), person_ax)
-    else:
-        table = KeyboardLevels(viewer.window)
+    table = make_table(args, viewer, person_ax)
     user = table
     arms = Arms(args.arms, args.arm_seed) if args.arms else None
     hide = tuple(i for i in range(3) if i not in person_ax)

@@ -369,6 +369,97 @@ def main() -> int:
     except ImportError:
         print("  --    pyflakes not installed; the lint gate is skipped")
 
+    # ---- a person's level has somewhere to go, in EVERY arrangement -----------
+    # It did not.  --motion vr owns all three axes, which made `auto_ax` empty, which
+    # built a bare KeyboardLevels with no `.own`, so every thumbstick push was dropped
+    # without a word -- and with a helper the table was a bare AutoUser, so the same.
+    # The sticks never worked in any configuration they were built for.
+    src_p2 = (HERE / "protocol.py").read_text()
+
+    def _grab(a, b):
+        i = src_p2.index(a)
+        return src_p2[i:src_p2.index(b, i)]
+
+    class _KL:                       # stands in for KeyboardLevels and AutoUser alike
+        def __init__(self, *a):
+            self.level = [1, 1, 1]
+
+        def reset(self):
+            self.level = [1, 1, 1]
+
+        def poll(self, t, g):
+            return False
+
+    ns_t = {"np": np, "MID": 1, "KeyboardLevels": _KL, "AutoUser": _KL}
+    exec(_grab("class SplitLevels:", "def make_table"), ns_t)
+    exec(_grab("def make_table", "def helper_table"), ns_t)
+    exec(_grab("def helper_table", "_HELPERS: dict"), ns_t)
+
+    class _Args:
+        seed_base, reaction = 70000, [0.2, 0.45]
+
+        def __init__(self, motion, helper, person):
+            self.motion, self.auto_user = motion, helper
+            self._person_ax = person
+            self._viewer = type("V", (), {"window": None})()
+
+    _lands = {}
+    for _name, _a, _p in (("vr", _Args("vr", False, (0, 1, 2)), (0, 1, 2)),
+                          ("vr+helper", _Args("vr", True, (0, 1, 2)), (0, 1, 2)),
+                          ("human", _Args("human", False, (2,)), (2,)),
+                          ("human+helper", _Args("human", True, (2,)), (2,))):
+        tbl = ns_t["make_table"](_a, _a._viewer, _p)
+        usr = (type("H", (), {"_table": ns_t["helper_table"](_a, 0, None)})()
+               if _a.auto_user else tbl)
+        _lands[_name] = ns_t["human_levels"](usr) is not None
+    bad += not check("a person's stiffness has somewhere to go in every arrangement",
+                     all(_lands.values()), str(_lands))
+
+    # ---- and the write is read as a takeover, exactly like a keypress ----------
+    class _Sp:
+        axes = (0, 1, 2)
+
+        def __init__(self):
+            self.own, self.auto = _KL(), _KL()
+            self.level, self.own_pressed = [1, 1, 1], False
+
+        def reset(self):
+            pass
+
+        def poll(self, t, g):
+            self.level = list(self.own.level)
+            return False
+
+    from stiffness_helper.console.vr import StickLevels
+    _tab = _Sp()
+    _hu = HU.HelperUser(StubSim(), None, Levels, _tab, version="v0", axes=("r",))
+    _hu.reset()
+    _hu._own_prev = list(_tab.own.level)
+    _hu.helper.level = [1, 1, 0]
+    _hu.poll(0.0, "contact")
+    _drove = _hu.level[2] == 0
+    _st = StickLevels()
+    _st.feed("drive", [0, -0.9])
+    for _ax, _sg in _st.drain():
+        _tab.own.level[_ax] = int(np.clip(_tab.own.level[_ax] + _sg, 0, 2))
+    _hu.poll(0.1, "contact")
+    bad += not check("a stick push is a takeover, exactly as a keypress is",
+                     _drove and _hu.level[2] == 2
+                     and any(e["code"] == "takeover" and e["model"] == 0
+                             for e in _hu.events),
+                     "the model's own choice is kept beside the person's")
+    _hu.poll(0.1 + _hu.HOLD + 0.1, "contact")
+    bad += not check("  ... and the model has the axis back after the hold",
+                     _hu.level[2] == 0)
+    _st.feed("off", [0, -0.9])
+    _st.feed("off", [0, 0])
+    _st.feed("off", [0.9, 0])
+    for _ax, _sg in _st.drain():
+        _tab.own.level[_ax] = int(np.clip(_tab.own.level[_ax] + _sg, 0, 2))
+    _hu.poll(5.0, "contact")
+    bad += not check("K_p is the person's and uncontested; only K_R is argued over",
+                     _hu.level[0] == 2 and _hu.level[1] == 2 and _hu.level[2] == 0)
+
     # ---- a walrus loop variable reassigned inside its own loop ---------------
     # No linter has this one: pyflakes sees a valid rebinding and pylint's
     # redefined-loop-name only covers `for` targets.  It cost a session -- the console's
