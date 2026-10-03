@@ -338,6 +338,7 @@ class Console:
         from stiffness_helper.console import wire
         self.w = wire
         self.cmds = wire.Commands()
+        self.frames = self.gated = 0
         # The band comes off THIS simulator, not the base class: the page draws the
         # force trace against it, and a console that drew a hard-coded 1-6 N would be
         # lying the moment a rig or a task used a different one.
@@ -349,6 +350,26 @@ class Console:
     def poll(self):
         m = self.cmds.poll()
         return m["cmd"] if m else None
+
+    # THE GATE CLOSING IS THE SILENT FAILURE HERE.  MHBench's recorder makes the point
+    # about its own arm: "the QP saturates silently when a target is past the arm --
+    # measured, 222 mm behind with no diagnostic at all -- so without this nothing
+    # distinguishes an unreachable demo from a good one."  This rig saturates somewhere
+    # else.  Its follower is an impedance, so being far behind is not failure -- in
+    # contact the deflection IS the force, measured at 9.2 mm median and 17.2 mm worst
+    # over 12 scripted episodes.  What fails quietly here is the ENERGY TANK: when it
+    # gates, the stiffness that was commanded is not the stiffness that was applied, and
+    # for a dataset whose entire subject is stiffness that is the worst thing that can
+    # happen without anybody noticing.  Over those same episodes alpha was 1.000 at every
+    # single frame, so anything below it is outside everything ever observed -- which is
+    # the threshold, and a VR operator waving a controller is far likelier to find it
+    # than a scripted one.
+    GATE_SHUT = 0.999
+
+    def new_episode(self) -> None:
+        """Per EPISODE, not per session: a gated fraction that counts every frame since
+        the process started says nothing about the demo just recorded."""
+        self.frames = self.gated = 0
 
     def tel(self, sim, user, k_cmd, kr_cmd, rtf):
         """What the screen shows is what the ROBOT HAS, not what it was asked for.
@@ -363,13 +384,18 @@ class Console:
         fn = float(sim.last["f_sensor_n"])
         ft = float(max(0.0, float(np.linalg.norm(f)) ** 2 - fn ** 2) ** 0.5)
         kd = sim.k_diag()                       # applied, along (u, v, n)
+        alpha = float(sim.last.get("alpha", 1.0))
+        self.frames += 1
+        self.gated += int(alpha < self.GATE_SHUT)
         self.w.emit("tel", t=round(float(sim.t), 3),
                     f_n=round(float(sim.last["f_n"]), 3), f_t=round(ft, 3),
                     lvl=[int(v) for v in user.level],
                     k=[float(kd[0]), float(kd[2]), float(sim.ctl.kr)],
                     k_req=[float(k_cmd[0]), float(k_cmd[2]), float(kr_cmd)],
                     rtf=round(float(rtf), 2), left=int((~sim.gone).sum()),
-                    down=bool(sim.last["pen_down"]), helper=self.helper_out(user))
+                    down=bool(sim.last["pen_down"]), helper=self.helper_out(user),
+                    alpha=round(alpha, 3),
+                    gated=round(self.gated / max(1, self.frames), 4))
 
     @staticmethod
     def helper_out(user):
@@ -633,6 +659,8 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
     # up to 0.1 s per frame and silently falls behind past that, so it has to say so.
     t_wall0, t_sim0 = time.time(), sim.t
     con = getattr(args, "_console", None)
+    if con is not None:
+        con.new_episode()
     last_frame, aborted = -1e9, False
     while not wr.done and sim.t < spec.time_limit:
         n_steps = 1
@@ -1174,6 +1202,7 @@ def main() -> None:
                 # backwards, and it made the target unreachable while an operator was
                 # still learning.  Only PASS discards, and that path never gets here.
                 con.episode(dict(row, compliance=row["compliance"]["overall"],
+                                 gated=round(con.gated / max(1, con.frames), 4),
                                  takeovers=(operator or {}).get("takeovers"),
                                  disagreements=(operator or {}).get("disagreements")))
             print("\n" + verdict_line(row, done[c], args.per_case))
