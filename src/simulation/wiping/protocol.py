@@ -621,6 +621,11 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
                 break
             elif c == "stop":
                 raise KeyboardInterrupt
+        if viewer is not None:
+            # Pacing to the wall clock belongs to the WINDOW: a person watching it needs
+            # the simulation to run at their speed.  Inserting the console block above
+            # had swallowed these five lines, which left a windowless console-driven
+            # collector stepping once per iteration.
             now = time.time()
             acc += min(now - last, 0.1)
             last = now
@@ -660,7 +665,12 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
         if sim.t - last_print > 0.5:
             last_print = sim.t
             rtf = (sim.t - t_sim0) / max(1e-6, time.time() - t_wall0)
-            if viewer is not None:
+            # NOT WHILE THE CONSOLE IS ATTACHED.  This line ends with \r and no
+            # newline, so the telemetry JSON written immediately after it landed on the
+            # SAME line and stopped being JSON -- the page showed no force, no stiffness
+            # and no camera while the demos themselves recorded perfectly.  The page
+            # carries all of it anyway, so with a console there is nothing to print.
+            if viewer is not None and con is None:
                 print(f"\r   t {sim.t:5.1f}s  {lv_str(user.level)}"
                       f"  board {sim.last['f_n']:4.1f} N  left {(~sim.gone).sum():3d}"
                       f"  {rtf:4.2f}x{' LAGGING' if rtf < 0.9 else '        '}",
