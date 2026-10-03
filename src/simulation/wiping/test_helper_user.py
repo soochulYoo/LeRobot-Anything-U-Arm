@@ -149,6 +149,74 @@ def main() -> int:
     else:
         print("  --    no checkpoints given; pass --ckpt-v0/--ckpt-v1 to pre-flight them")
 
+    # ---- the console tap: what the SIMULATOR sends to the page -----------------
+    # The mapping the operator actually watches -- sim camera to ui camera, sim force to
+    # ui force, sim stiffness to ui stiffness -- and it cannot be tried here because the
+    # simulator needs SAPIEN.  So `Console` is driven against a stub sim instead, which
+    # is enough: everything between `sim.last` and the wire is plain numpy.
+    import io
+    import json as _json
+
+    class TelSim:
+        """The six things protocol.Console asks of a simulator."""
+
+        class _Ctl:
+            kr = 3.0
+            K = np.diag([1000.0, 1000.0, 600.0])
+
+        class _Crit:
+            force_band = (1.0, 6.0)
+
+        t = 1.234
+        ctl, crit = _Ctl(), _Crit()
+        gone = np.zeros(14, dtype=bool)
+        last = dict(f_filt=np.array([0.3, 0.4, 3.0]), f_sensor_n=3.0, f_n=2.8,
+                    pen_down=True)
+
+        def k_diag(self, K=None):
+            return np.array([1000.0, 1000.0, 600.0])
+
+        def observe(self, images=True):
+            # a float frame scaled 0-1, the case a straight cast would turn black
+            return {"rgb_top_camera": np.ones((1, 32, 32, 3), np.float32) * 0.5,
+                    "rgb_wrist_camera": np.zeros((32, 32, 3), np.uint8)}
+
+    class _Lvl:
+        level = [1, 1, 0]
+
+    src_c = (HERE / "protocol.py").read_text()
+    ns_c = {"np": np, "SM": None}
+    exec(src_c[src_c.index("class Console:"):src_c.index("class Arms:")], ns_c)
+    out = io.StringIO()
+    import contextlib
+    with contextlib.redirect_stdout(out):
+        con = ns_c["Console"].__new__(ns_c["Console"])
+        from stiffness_helper.console import wire as W
+        con.w, con.cmds = W, None
+        con.tel(TelSim(), _Lvl(), np.array([3000.0, 3000.0, 1500.0]), 30.0, 0.98)
+        con.frame(TelSim())
+    evs = [_json.loads(l) for l in out.getvalue().splitlines() if l.startswith("{")]
+    tel = next(e for e in evs if e["ev"] == "tel")
+    frames = [e for e in evs if e["ev"] == "frame"]
+    # |f_t| = sqrt(|f|^2 - f_n^2) = sqrt(0.3^2 + 0.4^2) = 0.5 for this wrench
+    bad += not check("sim force -> ui force", abs(tel["f_n"] - 2.8) < 1e-6
+                     and abs(tel["f_t"] - 0.5) < 1e-3,
+                     f"normal {tel['f_n']} N, sliding {tel['f_t']} N")
+    bad += not check("sim stiffness -> ui stiffness is the APPLIED one",
+                     tel["k"] == [1000.0, 600.0, 3.0],
+                     "k_diag and ctl.kr, after the ramp and the tank")
+    bad += not check("and what was ASKED for goes too, so the gap is visible",
+                     tel["k_req"] == [3000.0, 1500.0, 30.0],
+                     "the tank refusing a stiffening is the thing worth seeing")
+    bad += not check("contact and progress reach the page",
+                     tel["down"] is True and tel["left"] == 14)
+    bad += not check("sim camera -> ui camera, both of them",
+                     [f["cam"] for f in frames] == ["top", "side"])
+    bad += not check("  ... and a float frame is not cast to black",
+                     all(len(f["jpg"]) > 100 for f in frames)
+                     and __import__("base64").b64decode(frames[0]["jpg"])[:3].hex()
+                     == "ffd8ff")
+
     # ---- the latched hand ------------------------------------------------------
     # The state machine a person drives the pad with.  It cannot be tried here (it needs
     # a window), and it is the thing they fight if it is wrong, so it is checked against

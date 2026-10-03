@@ -326,11 +326,16 @@ class Console:
     arrive through a queue a thread fills.
     """
 
-    def __init__(self):
+    def __init__(self, sim):
         from stiffness_helper.console import wire
         self.w = wire
         self.cmds = wire.Commands()
+        # The band comes off THIS simulator, not the base class: the page draws the
+        # force trace against it, and a console that drew a hard-coded 1-6 N would be
+        # lying the moment a rig or a task used a different one.
         wire.emit("ready", task="wiping", keys="G start / R done / N pass",
+                  band=[float(v) for v in sim.crit.force_band],
+                  ladders=None, cams=[n for n, _ in self.CAMS],
                   note="the keyboard still works; the console is a second source")
 
     def poll(self):
@@ -338,26 +343,52 @@ class Console:
         return m["cmd"] if m else None
 
     def tel(self, sim, user, k_cmd, kr_cmd, rtf):
+        """What the screen shows is what the ROBOT HAS, not what it was asked for.
+
+        `k_cmd`/`kr_cmd` are the ramp's target.  The applied stiffness is `sim.ctl`,
+        after the ramp and after the energy tank -- and the tank can refuse a stiffening,
+        which is precisely the moment an operator needs to see rather than a number that
+        says the stiffness arrived.  Both go out: `k` is what is in effect, `k_req` what
+        was asked, and the page shows the gap when there is one.
+        """
         f = np.asarray(sim.last["f_filt"], float)
         fn = float(sim.last["f_sensor_n"])
         ft = float(max(0.0, float(np.linalg.norm(f)) ** 2 - fn ** 2) ** 0.5)
+        kd = sim.k_diag()                       # applied, along (u, v, n)
         self.w.emit("tel", t=round(float(sim.t), 3),
                     f_n=round(float(sim.last["f_n"]), 3), f_t=round(ft, 3),
                     lvl=[int(v) for v in user.level],
-                    k=[float(k_cmd[0]), float(k_cmd[2]), float(kr_cmd)],
-                    rtf=round(float(rtf), 2), left=int((~sim.gone).sum()))
+                    k=[float(kd[0]), float(kd[2]), float(sim.ctl.kr)],
+                    k_req=[float(k_cmd[0]), float(k_cmd[2]), float(kr_cmd)],
+                    rtf=round(float(rtf), 2), left=int((~sim.gone).sum()),
+                    down=bool(sim.last["pen_down"]))
+
+    CAMS = (("top", "rgb_top_camera"), ("side", "rgb_wrist_camera"))
 
     def frame(self, sim):
+        """Both cameras.  One `observe` renders them both anyway, so the second costs
+        one more JPEG of a small image -- and the side view is where contact is visible,
+        which is the thing being collected."""
         try:
-            img = sim.observe(images=True)["rgb_top_camera"]
+            obs = sim.observe(images=True)
+        except Exception as e:                                 # noqa: BLE001
+            self.w.emit("log", msg=f"[console] no frame: {type(e).__name__}: {e}")
+            return
+        for name, key in self.CAMS:
+            img = obs.get(key)
+            if img is None:
+                continue
             a = np.asarray(img.cpu() if hasattr(img, "cpu") else img)
             while a.ndim > 3:
                 a = a[0]
-            j = self.w.jpeg(a)
+            # ManiSkill gives uint8, but a float frame scaled 0-1 would be destroyed by
+            # a straight cast, and the failure would look like a black camera.
+            if a.dtype != np.uint8:
+                a = (a * 255.0 if float(np.nanmax(a)) <= 1.0 else a)
+                a = np.clip(a, 0, 255).astype(np.uint8)
+            j = self.w.jpeg(a[..., :3])
             if j:
-                self.w.emit("frame", cam="top", jpg=j)
-        except Exception as e:                                 # noqa: BLE001
-            self.w.emit("log", msg=f"[console] no frame: {type(e).__name__}: {e}")
+                self.w.emit("frame", cam=name, jpg=j)
 
     def episode(self, row):
         self.w.emit("episode", row=row)
@@ -930,7 +961,7 @@ def main() -> None:
 
     # The console is built AFTER the simulator, so a scene that fails to load is a plain
     # traceback on stderr and not a half-open pipe the console has to time out.
-    con = Console() if args.console else None
+    con = Console(sim) if args.console else None
     args._console = con
 
     auto_ax = () if args.auto_axes == ["none"] else tuple(AXIS_OF[a] for a in args.auto_axes)
