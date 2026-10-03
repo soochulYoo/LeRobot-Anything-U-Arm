@@ -386,10 +386,15 @@ class Console:
         h = getattr(user, "helper", None)
         if h is None:
             return None
+        ev = getattr(user, "events", [])
+        held = [i for i, v in getattr(user, "_held", {}).items() if v is not None]
         return dict(v=getattr(user, "version", "?"),
                     axes=[int(a) for a in getattr(user, "axes", ())],
                     k_norm=[round(float(x), 3) for x in h.k_norm],
-                    lvl=[int(v) for v in h.level], calls=int(h.n_calls))
+                    lvl=[int(v) for v in h.level], calls=int(h.n_calls),
+                    held=[int(i) for i in held],
+                    takeovers=sum(e["code"] == "takeover" for e in ev),
+                    splits=sum(e["code"] == "shadow_disagree" for e in ev))
 
     CAMS = (("top", "rgb_top_camera"), ("side", "rgb_wrist_camera"))
 
@@ -479,6 +484,7 @@ class SplitLevels:
     def __init__(self, own, auto, axes):
         self.own, self.auto, self.axes = own, auto, tuple(axes)
         self._level = [MID, MID, MID]
+        self.own_pressed = False
 
     @property
     def level(self):
@@ -496,7 +502,10 @@ class SplitLevels:
         self._level = self._merge()
 
     def poll(self, t: float, group: str) -> bool:
-        self.own.poll(t, group)
+        # Remembered, not discarded: whether the PERSON just pressed something is how a
+        # helper tells an opinion from a standing default.  A level nobody chose is not
+        # a disagreement.
+        self.own_pressed = bool(self.own.poll(t, group))
         self.auto.poll(t, group)
         new = self._merge()
         changed = new != self._level
@@ -785,6 +794,8 @@ def _run_job(job) -> dict:
     rec = WipeRecorder(_SIM, images=not args.no_cameras,
                        video_every=2 if attempt < args.video else 0)
     res = run_episode(_SIM, spec, style, user, levels, args, recorder=rec, cues=False)
+    if operator is not None and hasattr(user, "record"):
+        operator = dict(operator, **user.record())
     _, _, row = save_episode(_SIM, rec, res, spec, style, levels, args, text, c, seed,
                              "protocol-scripted" if operator else "protocol-auto",
                              pathlib.Path(args.out), operator=operator)
@@ -1099,6 +1110,11 @@ def main() -> None:
                 # not answer the first question anyone asks of a blinded session: did
                 # the helper run at all.
                 operator = dict(operator, **user.record())
+            # AFTER the episode, so what goes in the h5 is what actually happened: the
+            # forward passes, the takeovers and the model/table splits.  Taken at user
+            # selection, as it used to be, every record said calls=0 and no events.
+            if operator is not None and hasattr(user, "record"):
+                operator = dict(operator, **user.record())
             keep, path, row = save_episode(
                 sim, rec, res, spec, style, levels, args, text, c, seed,
                 "protocol-human" if args.motion == "human" else
@@ -1129,7 +1145,9 @@ def main() -> None:
                 # and recover their labels in hindsight, so scoring them as discards is
                 # backwards, and it made the target unreachable while an operator was
                 # still learning.  Only PASS discards, and that path never gets here.
-                con.episode(dict(row, compliance=row["compliance"]["overall"]))
+                con.episode(dict(row, compliance=row["compliance"]["overall"],
+                                 takeovers=(operator or {}).get("takeovers"),
+                                 disagreements=(operator or {}).get("disagreements")))
             print("\n" + verdict_line(row, done[c], args.per_case))
     except KeyboardInterrupt:
         print("\n[quit] episode in progress discarded")

@@ -121,12 +121,22 @@ class HelperUser:
         # the whole simulator stack in and make this file impossible to test on its own.
         self._table = table
         self._level = [1, 1, 1]
+        self._held = {i: None for i in self.axes}     # when the person last took an axis
+        self._own_prev = None
+        self._dis_since = {i: None for i in self.axes}
+        self._dis_open = {i: False for i in self.axes}
+        self.events: list = []
 
     # ---- the interface run_episode uses --------------------------------------
     def reset(self) -> None:
         self.helper.reset()
         self._table.reset()
         self._level = list(self._table.level)
+        self._held = {i: None for i in self.axes}
+        self._own_prev = None
+        self._dis_since = {i: None for i in self.axes}
+        self._dis_open = {i: False for i in self.axes}
+        self.events = []
 
     @property
     def level(self):
@@ -156,6 +166,22 @@ class HelperUser:
             x_m=_np(rec["x_m"]), f_contact=_np(rec["f_filt"]),
             k_applied=k_applied, top=top, side=side)
 
+    # ---- arbitration on a contested axis -------------------------------------
+    # WHO DRIVES IS NOT A JUDGEMENT ABOUT WHO IS RIGHT.  K is not identifiable from
+    # (x, F), so at the instant of a disagreement there is no measurement that decides
+    # it -- which is the constraint this whole project exists under.  So the rule here
+    # is fixed and boring: the PERSON wins the moment they press, and keeps the axis
+    # until they have been quiet for HOLD seconds.  Nothing about accuracy enters.
+    #
+    # What the disagreement is FOR is the record.  A takeover says the helper was wrong,
+    # not what right would have been, so it is kept as an event -- with what the model
+    # wanted at that instant -- and the thing that turns it into a label is the hindsight
+    # labeler, offline.  Using takeovers directly as student targets is what keeps a rare
+    # signal rare.
+    HOLD = 3.0            # s of silence before the model gets a taken axis back
+    DIS_HOLD = 0.3        # s a model/table split must persist before it is an event
+    MAX_EVENTS = 400      # an episode's worth; a runaway log helps nobody
+
     def poll(self, t: float, group: str) -> bool:
         """-> True when the level changed.
 
@@ -166,16 +192,63 @@ class HelperUser:
         learning nothing.
         """
         self._table.poll(t, group)
+        own = getattr(self._table, "own", None)          # the person's own keys
+        auto = getattr(self._table, "auto", None)        # the protocol table
+        own_lvl = list(own.level) if own is not None else None
         new = list(self._table.level)
+
         for i in self.axes:
-            new[i] = self.helper.level[i]
+            model = int(self.helper.level[i])
+            # (1) a PRESS on an axis the model owns: the person takes it, and the model's
+            #     opinion at that instant is kept with it.
+            if (own_lvl is not None and self._own_prev is not None
+                    and own_lvl[i] != self._own_prev[i]):
+                self._held[i] = t
+                self._note(t, "takeover", i, human=own_lvl[i], model=model,
+                           phase=group)
+            held = self._held[i] is not None and t - self._held[i] < self.HOLD
+            if held:
+                new[i] = own_lvl[i]
+            else:
+                self._held[i] = None
+                new[i] = model
+
+            # (2) the standing second opinion is the PROTOCOL TABLE, not the person's
+            #     last keypress: a level nobody chose is not an opinion.  A split that
+            #     persists is an event, raised once per run rather than per tick.
+            rival = int(auto.level[i]) if auto is not None else None
+            if rival is None or rival == model:
+                if self._dis_open[i]:
+                    self._note(t, "agree_again", i, human=rival, model=model,
+                               phase=group)
+                self._dis_since[i], self._dis_open[i] = None, False
+            else:
+                if self._dis_since[i] is None:
+                    self._dis_since[i] = t
+                elif (not self._dis_open[i]
+                      and t - self._dis_since[i] >= self.DIS_HOLD):
+                    self._dis_open[i] = True
+                    self._note(t, "shadow_disagree", i, human=rival, model=model,
+                               phase=group, held=held)
+
+        self._own_prev = own_lvl
         changed = new != self._level
         self._level = new
         return changed
 
+    def _note(self, t: float, code: str, axis: int, **kw) -> None:
+        if len(self.events) >= self.MAX_EVENTS:
+            return
+        self.events.append(dict(t=round(float(t), 3), code=code, axis=int(axis),
+                                k_norm=round(float(self.helper.k_norm[axis]), 3), **kw))
+
     def record(self) -> dict:
         """What goes in the episode's `operator` attribute, so a log says what drove it."""
+        ev = self.events
         return dict(skill=f"helper-{self.version}", helper=self.version,
                     ckpt=self.ckpt, hz=self.hz,
                     axes=[a for a, i in self.AXES.items() if i in self.axes],
-                    calls=int(self.helper.n_calls))
+                    calls=int(self.helper.n_calls),
+                    takeovers=sum(e["code"] == "takeover" for e in ev),
+                    disagreements=sum(e["code"] == "shadow_disagree" for e in ev),
+                    events=list(ev))

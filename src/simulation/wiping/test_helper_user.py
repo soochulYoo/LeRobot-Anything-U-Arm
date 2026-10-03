@@ -218,6 +218,55 @@ def main() -> int:
                      and __import__("base64").b64decode(frames[0]["jpg"])[:3].hex()
                      == "ffd8ff")
 
+    # ---- arbitration on a contested axis ---------------------------------------
+    # Only reachable with a window, so it is driven here instead.  The rule under test
+    # is NOT about accuracy: K is not identifiable from (x, F), so at the instant of a
+    # disagreement nothing decides it.  The person wins, the model's opinion is kept
+    # beside theirs, and the hindsight labeler scores it later.
+    class _Lv:
+        def __init__(self, lv): self.level = list(lv)
+        def reset(self): pass
+        def poll(self, t, g): return False
+
+    class _Tab:
+        axes = (2,)
+        def __init__(self):
+            self.own, self.auto = _Lv([1, 1, 1]), _Lv([1, 1, 1])
+            self.own_pressed, self.level = False, [1, 1, 1]
+        def reset(self): pass
+        def poll(self, t, g):
+            self.level = list(self.auto.level)
+            self.level[2] = self.own.level[2]
+            return False
+
+    tab = _Tab()
+    arb = HU.HelperUser(StubSim(), None, Levels, tab, version="v0", axes=("r",))
+    arb.reset()
+    arb._own_prev = list(tab.own.level)
+    arb.helper.level = [1, 1, 0]                 # the model wants K_R low
+    for t in (0.0, 0.2, 0.4, 0.6):
+        arb.poll(t, "contact")
+    bad += not check("the model drives the axis it owns", arb.level[2] == 0)
+    bad += not check("a standing split with the table is one event, not one per tick",
+                     sum(e["code"] == "shadow_disagree" for e in arb.events) == 1)
+    tab.own.level[2] = 2                          # the person presses HIGH
+    arb.poll(1.0, "contact")
+    bad += not check("a press takes the axis back", arb.level[2] == 2)
+    tk = [e for e in arb.events if e["code"] == "takeover"]
+    bad += not check("the takeover keeps what the MODEL wanted beside it",
+                     len(tk) == 1 and tk[0]["human"] == 2 and tk[0]["model"] == 0
+                     and "k_norm" in tk[0],
+                     "it says the helper was wrong, not what right would have been")
+    arb.poll(2.0, "contact")
+    bad += not check("  ... and holds it while they are still working", arb.level[2] == 2)
+    arb.poll(1.0 + arb.HOLD + 0.1, "contact")
+    bad += not check(f"  ... and gives it back after {arb.HOLD} s of silence",
+                     arb.level[2] == 0)
+    r = arb.record()
+    bad += not check("the counts reach the episode record",
+                     r["takeovers"] == 1 and r["disagreements"] == 1
+                     and len(r["events"]) >= 2)
+
     # ---- the latched hand ------------------------------------------------------
     # The state machine a person drives the pad with.  It cannot be tried here (it needs
     # a window), and it is the thing they fight if it is wrong, so it is checked against
