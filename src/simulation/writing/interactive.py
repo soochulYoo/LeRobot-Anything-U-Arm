@@ -220,7 +220,10 @@ class VRHand:
             self.level_key = "down"
 
     def wrench(self, t, x_m, v_m, f_fb):
-        return self.map.wrench(x_m, v_m), self.k()
+        # The third column of the believed work frame is its outward normal -- the same
+        # axis KeyboardHuman presses along -- so the trigger pushes the tool into the
+        # surface and the pose is left to say where on it.
+        return self.map.wrench(x_m, v_m, normal=self.sim.W[:, 2]), self.k()
 
     def k(self):
         return np.asarray(self.sim.K0, dtype=float).copy()
@@ -232,6 +235,9 @@ class VRHand:
     @property
     def lift(self) -> bool:
         return not self.map.pressing and not self.map.clutched
+
+    def state(self) -> dict:
+        return self.map.state()
 
 
 CONTROLS = """
