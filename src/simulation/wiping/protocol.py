@@ -946,6 +946,13 @@ def main() -> None:
                 and (args.attempts is None or attempt[c] < args.attempts)]
         return None if not todo else min(todo, key=lambda c: (done[c], c))
 
+    # WHO OWNS WHICH AXIS is worked out before anything describes it.  The key map below
+    # prints only the axes the person sets, so computing these afterwards made the first
+    # line of a session a NameError -- on the viewer path, which nothing headless runs.
+    auto_ax = () if args.auto_axes == ["none"] else tuple(AXIS_OF[a] for a in args.auto_axes)
+    person_ax = tuple(i for i in range(3) if i not in auto_ax)
+    helper_ax = tuple(AXIS_OF[a] for a in args.helper_axes)
+
     if viewer is not None:
         print(__doc__.split("Usage:")[0].split("THE PROTOCOL")[1].split("A level change")[0])
         print("  levels  " + "   ".join(
@@ -972,9 +979,6 @@ def main() -> None:
     con = Console(sim) if args.console else None
     args._console = con
 
-    auto_ax = () if args.auto_axes == ["none"] else tuple(AXIS_OF[a] for a in args.auto_axes)
-    person_ax = tuple(i for i in range(3) if i not in auto_ax)
-    helper_ax = tuple(AXIS_OF[a] for a in args.helper_axes)
     if args.auto_user:
         table = None
     elif auto_ax:

@@ -293,6 +293,31 @@ def main() -> int:
     bad += not check("the table owns its axes and the person owns theirs",
                      sp.level == [0, 0, 2], f"{sp.level}")
 
+    # ---- lint: the paths this suite cannot run --------------------------------
+    # The viewer path is one of them, and that is where a key map referenced the axis
+    # ownership computed below it -- a NameError on the first line of a session, found
+    # only by a person running the real thing.  Code that cannot be executed here can
+    # still be read.  Only names used before they are bound are gated; a noisy gate
+    # gets switched off.
+    try:
+        import io as _io
+
+        from pyflakes.api import checkPath
+        from pyflakes.reporter import Reporter
+        _o, _e = _io.StringIO(), _io.StringIO()
+        _rep = Reporter(_o, _e)
+        for _f in sorted(HERE.glob("*.py")) + [HERE.parent / "writing" / n for n in
+                                               ("protocol.py", "interactive.py",
+                                                "teleop.py")]:
+            checkPath(str(_f), _rep)
+        _hits = [ln for ln in _o.getvalue().splitlines()
+                 if "undefined name" in ln or "referenced before assignment" in ln]
+        bad += not check("no name is used before it is bound", not _hits,
+                         "; ".join(h.split("/")[-1] for h in _hits[:3]) if _hits
+                         else "pyflakes, wiping + the writing modules it builds on")
+    except ImportError:
+        print("  --    pyflakes not installed; the lint gate is skipped")
+
     # ---- the arm schedule ---------------------------------------------------
     src = (HERE / "protocol.py").read_text()
     ns = {"np": np}
