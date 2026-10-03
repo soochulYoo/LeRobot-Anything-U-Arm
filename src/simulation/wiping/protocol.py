@@ -327,6 +327,14 @@ class Console:
     """
 
     def __init__(self, sim):
+        # `helper_user` OWNS finding the stiffness_helper checkout -- $STIFFNESS_HELPER,
+        # then an ancestor of itself -- and puts it on sys.path as it loads.  Importing
+        # it first is what makes the next line work: the collector runs with the wiping
+        # directory as its cwd and nothing else on the path, so a bare
+        # `from stiffness_helper...` raised ModuleNotFoundError AFTER the viewer had
+        # already opened, which looked exactly like the simulator crashing.  It costs
+        # nothing: that module imports numpy and three standard-library names.
+        import helper_user  # noqa: F401
         from stiffness_helper.console import wire
         self.w = wire
         self.cmds = wire.Commands()
