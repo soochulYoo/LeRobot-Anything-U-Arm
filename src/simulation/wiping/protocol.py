@@ -723,7 +723,11 @@ def save_episode(sim, rec, res, spec, style, levels, args, text: str, c: int, se
             imageio.mimsave(path.with_suffix(".mp4"), rec.video, fps=5, quality=7,
                             macro_block_size=1)
     reason = ", ".join(filter(None, [res["fail_reason"], "" if ok_comp else "protocol"]))
-    row = dict(case=c, text=text, board=args.board, seed=seed, kept=keep,
+    # `kept` IS "A FILE EXISTS" AND `scored` IS "IT MET THE CRITERIA".  One word for
+    # two ideas is what made a saved demo read as discarded in the console and kept the
+    # on-screen counter frozen for a whole session; the distinction is now in the name.
+    row = dict(case=c, text=text, board=args.board, seed=seed,
+               kept=bool(path), scored=bool(keep),
                saved=str(path) if path else None, success=bool(res["success"]),
                reason=reason, compliance=comp, erased=res["erased"],
                in_band=res["in_band"], peak_force=res["peak_force"], t=res["t"])
@@ -732,7 +736,9 @@ def save_episode(sim, rec, res, spec, style, levels, args, text: str, c: int, se
 
 def verdict_line(row: dict, done: int, per_case: int) -> str:
     comp = row["compliance"]
-    v = "KEPT" if row["kept"] else f"not kept: {row['reason']}"
+    v = ("GOOD" if row["scored"] else
+         f"saved, did not score: {row['reason']}" if row["kept"] else
+         f"not kept: {row['reason']}")
     return (f"[{v}] erased {row['erased']:.2f} in-band {row['in_band']:.2f} "
             f"peak {row['peak_force']:.1f} N | protocol "
             + " ".join(f"{g} {100 * comp[g]:.0f}%" for g in GROUPS if comp[g] == comp[g])
@@ -1062,7 +1068,8 @@ def main() -> None:
                     # "recording" for the rest of the session waiting for an episode
                     # that was thrown away.
                     con.episode(dict(case=c, text=text, board=args.board, seed=seed,
-                                     attempt=attempt[c], kept=False, success=False,
+                                     attempt=attempt[c], kept=False, scored=False,
+                                     success=False,
                                      reason="passed", arm=(operator or {}).get("arm"),
                                      motion=args.motion))
                 continue
@@ -1102,8 +1109,7 @@ def main() -> None:
                 # and recover their labels in hindsight, so scoring them as discards is
                 # backwards, and it made the target unreachable while an operator was
                 # still learning.  Only PASS discards, and that path never gets here.
-                con.episode(dict(row, compliance=row["compliance"]["overall"],
-                                 kept=bool(path), scored=bool(keep)))
+                con.episode(dict(row, compliance=row["compliance"]["overall"]))
             print("\n" + verdict_line(row, done[c], args.per_case))
     except KeyboardInterrupt:
         print("\n[quit] episode in progress discarded")
