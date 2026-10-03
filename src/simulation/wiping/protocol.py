@@ -1088,8 +1088,17 @@ def main() -> None:
             if args.console:
                 # AFTER save_episode: the console's loop advances on this event, so it
                 # must not arrive before the file it refers to exists on disk.
+                #
+                # `kept` IS "A FILE EXISTS", NOT "THE TASK SUCCEEDED".  `keep` above means
+                # the episode met the success criteria AND the protocol compliance, which
+                # is a quality verdict and belongs in `success`, where it already is.  A
+                # demo the operator chose to keep, and whose file is on disk, must count
+                # toward the generation -- this project exists to collect imperfect demos
+                # and recover their labels in hindsight, so scoring them as discards is
+                # backwards, and it made the target unreachable while an operator was
+                # still learning.  Only PASS discards, and that path never gets here.
                 con.episode(dict(row, compliance=row["compliance"]["overall"],
-                                 kept=bool(keep)))
+                                 kept=bool(path), scored=bool(keep)))
             print("\n" + verdict_line(row, done[c], args.per_case))
     except KeyboardInterrupt:
         print("\n[quit] episode in progress discarded")
