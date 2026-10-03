@@ -369,7 +369,27 @@ class Console:
                     k=[float(kd[0]), float(kd[2]), float(sim.ctl.kr)],
                     k_req=[float(k_cmd[0]), float(k_cmd[2]), float(kr_cmd)],
                     rtf=round(float(rtf), 2), left=int((~sim.gone).sum()),
-                    down=bool(sim.last["pen_down"]))
+                    down=bool(sim.last["pen_down"]), helper=self.helper_out(user))
+
+    @staticmethod
+    def helper_out(user):
+        """WHAT THE MODEL SAID, separately from what the robot got.
+
+        The applied stiffness alone cannot answer "is the model actually doing
+        anything": on the axes it does not own it is the table's number, and on the one
+        it does own its choice and the table's can coincide.  So the model's own output
+        goes out beside it -- the continuous k_norm it produced, the levels that snapped
+        to, which axes it owns, and how many forward passes it has run, which is the one
+        number that distinguishes a model that is thinking from a model that is not
+        loaded.
+        """
+        h = getattr(user, "helper", None)
+        if h is None:
+            return None
+        return dict(v=getattr(user, "version", "?"),
+                    axes=[int(a) for a in getattr(user, "axes", ())],
+                    k_norm=[round(float(x), 3) for x in h.k_norm],
+                    lvl=[int(v) for v in h.level], calls=int(h.n_calls))
 
     CAMS = (("top", "rgb_top_camera"), ("side", "rgb_wrist_camera"))
 
