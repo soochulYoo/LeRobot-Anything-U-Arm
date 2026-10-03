@@ -16,6 +16,7 @@ scan in the session notes; the viewer is checked by running one episode.
 """
 from __future__ import annotations
 
+import ast
 import pathlib
 import sys
 
@@ -317,6 +318,40 @@ def main() -> int:
                          else "pyflakes, wiping + the writing modules it builds on")
     except ImportError:
         print("  --    pyflakes not installed; the lint gate is skipped")
+
+    # ---- a walrus loop variable reassigned inside its own loop ---------------
+    # No linter has this one: pyflakes sees a valid rebinding and pylint's
+    # redefined-loop-name only covers `for` targets.  It cost a session -- the console's
+    # command was bound to `c`, the case index of `while (c := next_case())`, so a demo
+    # started from the browser was saved under case "collect" and then raised KeyError.
+    # The rule is narrow and sound: the condition recomputes the name every iteration,
+    # so assigning it in the body is either dead or wrong.
+    def walrus_clobbers(path):
+        tree = ast.parse(pathlib.Path(path).read_text())
+        out = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.While):
+                continue
+            names = {w.target.id for w in ast.walk(node.test)
+                     if isinstance(w, ast.NamedExpr) and isinstance(w.target, ast.Name)}
+            if not names:
+                continue
+            for stmt in node.body:
+                for n in ast.walk(stmt):
+                    tgt = ([n.target] if isinstance(n, (ast.AugAssign, ast.NamedExpr))
+                           else n.targets if isinstance(n, ast.Assign) else [])
+                    for t in tgt:
+                        if isinstance(t, ast.Name) and t.id in names:
+                            out.append(f"{pathlib.Path(path).name}:{t.lineno} "
+                                       f"reassigns `{t.id}` inside `while ({t.id} := ...)`")
+        return out
+
+    _clob = []
+    for _f in sorted(HERE.glob("*.py")) + sorted((HERE.parent / "writing").glob("*.py")):
+        _clob += walrus_clobbers(_f)
+    bad += not check("no walrus loop variable is reassigned inside its own loop",
+                     not _clob, "; ".join(_clob[:3]) if _clob
+                     else "wiping + writing, every while-walrus")
 
     # ---- the arm schedule ---------------------------------------------------
     src = (HERE / "protocol.py").read_text()

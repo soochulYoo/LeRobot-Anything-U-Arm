@@ -611,15 +611,15 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
                 print("\n[finished by hand]")
                 wr.done = True
         if con is not None:
-            c = con.poll()
-            if c == "done":
+            cmd = con.poll()
+            if cmd == "done":
                 print("\n[finished from the console]")
                 wr.done = True
-            elif c == "pass":
+            elif cmd == "pass":
                 print("\n[passed from the console]")
                 aborted = True
                 break
-            elif c == "stop":
+            elif cmd == "stop":
                 raise KeyboardInterrupt
         if viewer is not None:
             # Pacing to the wall clock belongs to the WINDOW: a person watching it needs
@@ -1037,10 +1037,16 @@ def main() -> None:
                             raise KeyboardInterrupt
                         sim.env.render_human()
                     if args.console:
-                        c = con.poll()
-                        if c == "collect":
+                        # NOT `c`.  This loop is inside `while (c := next_case())`, and
+                        # binding the console's command to the same name destroyed the
+                        # case index: starting a demo from the browser saved it under
+                        # case "collect" and then raised KeyError on `attempt[c]`.
+                        # Pressing G in the window broke out before this ran, so only
+                        # the console path was affected -- and only after the demo.
+                        cmd = con.poll()
+                        if cmd == "collect":
                             break
-                        if c == "stop":
+                        if cmd == "stop":
                             raise KeyboardInterrupt
                     if viewer is None:
                         time.sleep(0.02)
