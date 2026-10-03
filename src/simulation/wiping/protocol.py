@@ -1082,7 +1082,12 @@ def main() -> None:
             row["arm"] = (operator or {}).get("arm")
             row["calls"] = (operator or {}).get("calls")
             row["motion"] = args.motion
-            done[c] += int(keep)
+            # COUNT WHAT IS ON DISK, which is how `done` was INITIALISED: by globbing
+            # ep_*.h5.  Incrementing on `keep` instead meant that with --keep-failed
+            # every demo wrote a file and the counter never moved -- it read 3/60 for a
+            # whole session while files piled up, so it looked like nothing was being
+            # saved -- and then jumped on the next run, when the glob counted them all.
+            done[c] += int(bool(path))
             attempt[c] += 1
             log(row)
             if args.console:
