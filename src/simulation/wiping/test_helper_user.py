@@ -194,6 +194,7 @@ def main() -> int:
         con = ns_c["Console"].__new__(ns_c["Console"])
         from stiffness_helper.console import wire as W
         con.w, con.cmds = W, None
+        con.new_episode()
         con.tel(TelSim(), _Lvl(), np.array([3000.0, 3000.0, 1500.0]), 30.0, 0.98)
         con.frame(TelSim())
     evs = [_json.loads(l) for l in out.getvalue().splitlines() if l.startswith("{")]

@@ -191,14 +191,15 @@ class VRHand:
     """
 
     def __init__(self, sim, params=None):
-        from stiffness_helper.console.vr import MapperParams, PoseMapper, VRState
+        from stiffness_helper.console.vr import (MapperParams, PoseMapper, StickLevels,
+                                                 VRState)
         self._VRState = VRState
         self.sim = sim
         self.map = PoseMapper(params or MapperParams())
         self.map.reset(home=sim.last["p"] if sim.last else None)
+        self.sticks = StickLevels()
         self.done = False
         self.discard = False
-        self.level_key = None            # "up" / "down", read and cleared by the caller
         self._seen = -1.0
 
     def feed(self, msg) -> None:
@@ -214,10 +215,17 @@ class VRHand:
         b = msg.get("buttons") or {}
         self.done = self.done or bool(b.get("done"))
         self.discard = self.discard or bool(b.get("pass"))
-        if b.get("stick_up"):
-            self.level_key = "up"
-        elif b.get("stick_down"):
-            self.level_key = "down"
+        # The driving hand's stick is K_R; the other hand's is K_p.  Which hand drives
+        # comes from the page, so a left-handed operator changes nothing here.
+        sticks = msg.get("sticks") or {}
+        drive = msg.get("hand")
+        for hand, axes in sticks.items():
+            self.sticks.feed("drive" if hand == drive else "off", axes)
+
+    def levels(self) -> list:
+        """(axis, +1 stiffer / -1 softer) since the last call -- the same vocabulary
+        `Arbiter.human_adjust` takes, because a stick springs back and a level does not."""
+        return self.sticks.drain()
 
     def wrench(self, t, x_m, v_m, f_fb):
         # The third column of the believed work frame is its outward normal -- the same

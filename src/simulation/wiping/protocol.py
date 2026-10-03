@@ -365,6 +365,11 @@ class Console:
     # the threshold, and a VR operator waving a controller is far likelier to find it
     # than a scripted one.
     GATE_SHUT = 0.999
+    # Class defaults, so `tel` works on an instance whose episode has not been opened
+    # yet.  A counter that only exists after a particular call is a counter whose
+    # absence is an AttributeError in the middle of a control loop.
+    frames = 0
+    gated = 0
 
     def new_episode(self) -> None:
         """Per EPISODE, not per session: a gated fraction that counts every frame since
@@ -685,14 +690,14 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
                 print("\n[passed from the controller]")
                 aborted = True
                 break
-            if vr.level_key:
-                # The thumbstick is the person's own K_R key, and it reaches the same
-                # place a keypress does -- the keyboard half of the table -- so a
-                # helper arm sees it as a takeover exactly as it sees key 4/5/6.
-                own = getattr(getattr(user, "_table", user), "own", None)
-                if own is not None:
-                    own.level[AXIS_OF["r"]] = 2 if vr.level_key == "up" else 0
-                vr.level_key = None
+            # A stick push is one rung, and it reaches the same place a keypress does
+            # -- the keyboard half of the table -- so a helper arm reads it as a
+            # takeover exactly as it reads key 4/5/6.  Relative rather than absolute
+            # because a stick springs back to centre; see vr.StickLevels.
+            own = getattr(getattr(user, "_table", user), "own", None)
+            if own is not None:
+                for ax, sign in vr.levels():
+                    own.level[ax] = int(np.clip(own.level[ax] + sign, 0, 2))
         if con is not None:
             cmd = con.poll()
             if cmd == "done":
@@ -967,7 +972,14 @@ def main() -> None:
                      "biased before it started.  Filter afterwards, in the report.")
         args.arms = sorted(set(args.arms))
     if args.auto_axes is None:
-        args.auto_axes = (["t", "n"] if (args.motion == "human" or args.arms)
+        # A KEYBOARD AND A CONTROLLER CAN CARRY DIFFERENT LOADS.  Hand-keying xy and z
+        # on nine keys while steering is reaction noise on top of the one axis being
+        # compared, so the table drives them there.  Two thumbsticks carry three axes
+        # without a key at all -- one rung per push, no mode -- so in VR the person
+        # keeps K_p as well, which is what makes a demo their stiffness and not the
+        # table's.  --auto-axes overrides either way.
+        args.auto_axes = (["none"] if args.motion == "vr"
+                          else ["t", "n"] if (args.motion == "human" or args.arms)
                           else ["none"])
     if args.auto_axes != ["none"] and not set(args.auto_axes) <= set(AXIS_OF):
         ap.error(f"--auto-axes takes {' '.join(AXIS_OF)} or none")
