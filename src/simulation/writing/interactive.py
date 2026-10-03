@@ -177,6 +177,63 @@ class LatchedHand(KeyboardHuman):
                         "U  press   O  lift\n  F  faster   X  stop everything")
 
 
+class VRHand:
+    """A VR controller in the keyboard's place.  Same three members the writer reads.
+
+    The controller's pose is the rest point of a hand spring, not a commanded pose --
+    see `stiffness_helper.console.vr.PoseMapper`, and the reason is that this rig is
+    bilateral.  Writing the pose into the handle would delete the force the operator is
+    meant to feel, which on a stiffness-collection rig is the one sensation that matters.
+
+    Samples arrive over the console's pipe, so this class does no I/O: `feed` is called
+    with whatever the loop last received and may be called with None for as long as the
+    network likes.  The mapper's dead-man handles that.
+    """
+
+    def __init__(self, sim, params=None):
+        from stiffness_helper.console.vr import MapperParams, PoseMapper, VRState
+        self._VRState = VRState
+        self.sim = sim
+        self.map = PoseMapper(params or MapperParams())
+        self.map.reset(home=sim.last["p"] if sim.last else None)
+        self.done = False
+        self.discard = False
+        self.level_key = None            # "up" / "down", read and cleared by the caller
+        self._seen = -1.0
+
+    def feed(self, msg) -> None:
+        """One `vr` message off the wire, or None."""
+        if not msg:
+            self.map.update(None)
+            return
+        if msg.get("t", 0.0) == self._seen:
+            return                       # the same sample again is not new information
+        self._seen = float(msg.get("t", 0.0))
+        st = self._VRState.from_json(msg)
+        self.map.update(st)
+        b = msg.get("buttons") or {}
+        self.done = self.done or bool(b.get("done"))
+        self.discard = self.discard or bool(b.get("pass"))
+        if b.get("stick_up"):
+            self.level_key = "up"
+        elif b.get("stick_down"):
+            self.level_key = "down"
+
+    def wrench(self, t, x_m, v_m, f_fb):
+        return self.map.wrench(x_m, v_m), self.k()
+
+    def k(self):
+        return np.asarray(self.sim.K0, dtype=float).copy()
+
+    @property
+    def press(self) -> bool:
+        return self.map.pressing
+
+    @property
+    def lift(self) -> bool:
+        return not self.map.pressing and not self.map.clutched
+
+
 CONTROLS = """
   J / L  left / right      I / K  up / down the letter      U  press      O  lift
   SHIFT  faster (not harder)      1 / 2  in-plane K down / up      3 / 4  normal K down / up

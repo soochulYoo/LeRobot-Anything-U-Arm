@@ -595,12 +595,19 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
     # W frame, K0, target.strokes and the pen_down flag that class reads, and the loop
     # below already calls exactly the attributes it offers.  Nobody plans the strokes
     # now, so `wr.phase` is read off the hand and only R ends the episode.
-    human = getattr(args, "motion", "wiper") == "human"
+    motion = getattr(args, "motion", "wiper")
+    human = motion in ("human", "vr")
+    vr = None
     if human:
         if viewer is None:
-            raise RuntimeError("--motion human needs a window")
-        wr = WP.KeyboardWriter(viewer.window, sim,
-                               latch=getattr(args, "keys", "latch") == "latch")
+            raise RuntimeError(f"--motion {motion} needs a window")
+        if motion == "vr":
+            import interactive as I
+            vr = I.VRHand(sim)
+            wr = WP.KeyboardWriter(viewer.window, sim, hand=vr)
+        else:
+            wr = WP.KeyboardWriter(viewer.window, sim,
+                                   latch=getattr(args, "keys", "latch") == "latch")
     else:
         wr = WT.SyntheticWiper(sim, dataclasses.replace(style, hover_dwell=args.dwell,
                                                         v_desc=args.v_desc,
@@ -639,6 +646,25 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
             if human and w.key_press("r"):
                 print("\n[finished by hand]")
                 wr.done = True
+        if vr is not None and con is not None:
+            # The newest pose, every iteration: the mapper decides what a gap means,
+            # and a backlog of stale poses would be worse than none.
+            vr.feed(con.cmds.vr())
+            if vr.done:
+                print("\n[finished from the controller]")
+                wr.done = True
+            elif vr.discard:
+                print("\n[passed from the controller]")
+                aborted = True
+                break
+            if vr.level_key:
+                # The thumbstick is the person's own K_R key, and it reaches the same
+                # place a keypress does -- the keyboard half of the table -- so a
+                # helper arm sees it as a takeover exactly as it sees key 4/5/6.
+                own = getattr(getattr(user, "_table", user), "own", None)
+                if own is not None:
+                    own.level[AXIS_OF["r"]] = 2 if vr.level_key == "up" else 0
+                vr.level_key = None
         if con is not None:
             cmd = con.poll()
             if cmd == "done":
@@ -851,9 +877,9 @@ def main() -> None:
                          "in their `operator` attribute")
     ap.add_argument("--reaction", type=float, nargs=2, default=[0.20, 0.45],
                     metavar=("MIN", "MAX"))
-    ap.add_argument("--motion", choices=("wiper", "human"), default="wiper",
-                    help="who moves the pad: the synthetic wiper, or a person on "
-                         "IJKL/U/O (writing/protocol.py's KeyboardWriter; R ends it)")
+    ap.add_argument("--motion", choices=("wiper", "human", "vr"), default="wiper",
+                    help="who moves the pad: the synthetic wiper, a person on "
+                         "IJKL/U/O, or a VR controller through the console (--console)")
     ap.add_argument("--console", action="store_true",
                     help="driven by stiffness_helper.console over the pipe: telemetry "
                          "out, COLLECT/DONE/PASS in, alongside the keyboard")
@@ -917,8 +943,10 @@ def main() -> None:
                           else ["none"])
     if args.auto_axes != ["none"] and not set(args.auto_axes) <= set(AXIS_OF):
         ap.error(f"--auto-axes takes {' '.join(AXIS_OF)} or none")
-    if args.motion == "human" and args.headless:
-        ap.error("--motion human needs a window: nobody can press keys without one")
+    if args.motion in ("human", "vr") and args.headless:
+        ap.error(f"--motion {args.motion} needs a window")
+    if args.motion == "vr" and not args.console:
+        ap.error("--motion vr needs --console: the controller samples arrive on that pipe")
     if args.console and args.workers > 1:
         ap.error("--console drives one episode at a time; --workers is for a batch")
     if args.headless and not args.auto_user:

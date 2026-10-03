@@ -225,12 +225,15 @@ class KeyboardWriter:
     RELEASE = 0.15     # s
     F_CLEAR = 0.2      # N of pressure, below which the pen is off the paper
 
-    def __init__(self, window, sim, latch: bool = False):
+    def __init__(self, window, sim, latch: bool = False, hand=None):
         import interactive as I
         self.win, self.sim = window, sim
         # `latch` is the hand that needs no two keys at once: the same forces, tapped
         # instead of held.  See interactive.LatchedHand for why that is not a preference.
-        self.hand = (I.LatchedHand if latch else I.KeyboardHuman)(window, sim.W, sim.K0)
+        # `hand` replaces it outright -- a VR controller is a different leader, not a
+        # different key map, and the phase machine below does not care which it is.
+        self.hand = hand or (I.LatchedHand if latch
+                             else I.KeyboardHuman)(window, sim.W, sim.K0)
         self.strokes = sim.target.strokes
         self.phase, self.k, self.done = "travel", 0, False
         self._idle = 0.0
