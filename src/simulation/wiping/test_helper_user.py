@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import time
 import sys
 
 import numpy as np
@@ -369,6 +370,47 @@ def main() -> int:
     except ImportError:
         print("  --    pyflakes not installed; the lint gate is skipped")
 
+    # ---- the VR hand against a sticky mailbox and a reloaded page -------------
+    # Both are wire-level, so the mapper's own tests cannot see them: the console hands
+    # back the LAST pose for ever, and the browser's clock restarts at zero on a reload.
+    src_i = (HERE.parent / "writing" / "interactive.py").read_text()
+    ns_v = {"np": np}
+    exec(src_i[src_i.index("class VRHand:"):src_i.index('CONTROLS = """')], ns_v)
+
+    class _Sim0:
+        W = np.eye(3)
+        K0 = np.array([1000.0, 1000.0, 1000.0])
+        last = {"p": np.array([0.0, 0.0, 0.30])}
+
+    def _m(t, y):
+        return {"t": t, "pos": [0, y, -0.4], "quat": [1, 0, 0, 0], "trigger": 0.0,
+                "ok": True, "hand": "right", "sticks": {}, "buttons": {}}
+
+    vh = ns_v["VRHand"](_Sim0())
+    vh.feed(_m(10.0, 1.20))
+    vh.map.target = np.array([0.2, 0.0, 0.30])
+    vh.map.last_t = time.time() - 5.0
+    for _ in range(40):
+        vh.feed(_m(10.0, 1.20))              # the loop polls; the mailbox never empties
+    bad += not check("the dead-man elapses on a mailbox that keeps repeating itself",
+                     vh.map.stale and np.allclose(
+                         vh.map.wrench([0, 0, 0.30], np.zeros(3)), 0),
+                     "a headset that goes quiet stops pulling the tool")
+    vh.feed(_m(11.0, 1.20))
+    bad += not check("  ... and a fresh sample revives it", not vh.map.stale)
+
+    vh2 = ns_v["VRHand"](_Sim0())
+    for i in range(5):
+        vh2.feed(_m(10.0 + 0.03 * i, 1.20 + 0.01 * i))
+    _was = vh2.map.target.copy()
+    vh2.feed(_m(0.02, 1.60))                 # a reload: the clock restarts, hand moved
+    bad += not check("a reloaded page re-references instead of jumping the tool",
+                     np.allclose(vh2.map.target, _was),
+                     "the browser clock starts at zero on every load")
+    vh2.feed(_m(0.05, 1.63))
+    bad += not check("  ... and relative motion resumes from there",
+                     abs(float(vh2.map.target[2] - _was[2]) - 0.03) < 1e-9)
+
     # ---- a person's level has somewhere to go, in EVERY arrangement -----------
     # It did not.  --motion vr owns all three axes, which made `auto_ax` empty, which
     # built a bare KeyboardLevels with no `.own`, so every thumbstick push was dropped
@@ -409,7 +451,7 @@ def main() -> int:
                           ("human", _Args("human", False, (2,)), (2,)),
                           ("human+helper", _Args("human", True, (2,)), (2,))):
         tbl = ns_t["make_table"](_a, _a._viewer, _p)
-        usr = (type("H", (), {"_table": ns_t["helper_table"](_a, 0, None)})()
+        usr = (type("H", (), {"_table": ns_t["helper_table"](_a, 0)})()
                if _a.auto_user else tbl)
         _lands[_name] = ns_t["human_levels"](usr) is not None
     bad += not check("a person's stiffness has somewhere to go in every arrangement",

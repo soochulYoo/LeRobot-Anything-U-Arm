@@ -208,8 +208,23 @@ class VRHand:
             self.map.update(None)
             return
         if msg.get("t", 0.0) == self._seen:
-            return                       # the same sample again is not new information
-        self._seen = float(msg.get("t", 0.0))
+            # THE SAME SAMPLE AGAIN IS NOT NEW INFORMATION -- and the mailbox on the
+            # wire is sticky, so a headset that goes quiet keeps handing back its last
+            # pose for ever.  Returning here left the mapper's clock untouched, the
+            # dead-man never elapsed, and a disconnected controller went on pulling the
+            # tool toward wherever it was last pointing.  `update(None)` is the path
+            # that lets the timeout run; this is what it is for.
+            self.map.update(None)
+            return
+        t = float(msg.get("t", 0.0))
+        if t < self._seen:
+            # TIME WENT BACKWARDS, so this is a new page: the browser's clock starts at
+            # zero on every load.  The reference pose is from the old one, and the
+            # operator's hand is wherever it happens to be now, so keeping it would jump
+            # the tool by the difference.  Dropping it makes the next sample home again,
+            # which is what the first sample of any session already means.
+            self.map.ref_ctrl = None
+        self._seen = t
         st = self._VRState.from_json(msg)
         self.map.update(st)
         b = msg.get("buttons") or {}

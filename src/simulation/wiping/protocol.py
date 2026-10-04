@@ -562,7 +562,7 @@ def make_table(args, viewer, person_ax):
                        AutoUser(args.seed_base, tuple(args.reaction)), person_ax)
 
 
-def helper_table(args, seed: int, levels):
+def helper_table(args, seed: int):
     """What a helper's non-owned axes follow: the protocol table, plus the person's own
     keys when a person is there to press them."""
     auto = AutoUser(seed, tuple(args.reaction))
@@ -650,7 +650,7 @@ def tiered(sim, style, seed: int, levels, args):
             # helper owns its axes outright, a press or a stick push has nowhere to go,
             # and the takeover record this loop is built on can never fire.
             _HELPER_USER = HU.HelperUser(sim, args.helper, levels,
-                                         helper_table(args, seed, levels),
+                                         helper_table(args, seed),
                                          version=args.helper_version or "v1",
                                          axes=tuple(args.helper_axes))
         _HELPER_USER.reset()
