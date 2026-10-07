@@ -188,6 +188,8 @@ def main() -> int:
 
     src_c = (HERE / "protocol.py").read_text()
     ns_c = {"np": np, "SM": None}
+    WHO_SRC = src_c[src_c.index("WHO = ("):src_c.index("class WipeRecorder(")]
+    exec(WHO_SRC, ns_c)
     exec(src_c[src_c.index("class Console:"):src_c.index("class Arms:")], ns_c)
     out = io.StringIO()
     import contextlib
@@ -211,6 +213,9 @@ def main() -> int:
     bad += not check("and what was ASKED for goes too, so the gap is visible",
                      tel["k_req"] == [3000.0, 1500.0, 30.0],
                      "the tank refusing a stiffening is the thing worth seeing")
+    bad += not check("and whose level each axis has, with where the person's stick stands",
+                     tel.get("who") == dict(human=[-1, -1, -1], table=[1, 1, 0],
+                                            source=[0, 0, 0]), f"{tel.get('who')}")
     bad += not check("contact and progress reach the page",
                      tel["down"] is True and tel["left"] == 14)
     bad += not check("sim camera -> ui camera, both of them",
@@ -249,11 +254,30 @@ def main() -> int:
     for t in (0.0, 0.2, 0.4, 0.6):
         arb.poll(t, "contact")
     bad += not check("the model drives the axis it owns", arb.level[2] == 0)
+    # WHO WANTED WHAT, beside the level that won.  The applied level alone cannot be
+    # taken apart afterwards, so each step records all three and whose was applied.
+    o = arb.opinions()
+    bad += not check("each step records whose level an axis has",
+                     list(o["k_source"]) == [arb.TABLE, arb.TABLE, arb.MODEL],
+                     f"{list(o['k_source'])}")
+    bad += not check("  ... with the model's level, the person's and the table's",
+                     list(o["k_level_model"]) == [1, 1, 0]
+                     and list(o["k_level_human"]) == [1, 1, 1]
+                     and list(o["k_level_table"]) == [1, 1, 1])
+    bad += not check("  ... and a model that has not run has said nothing",
+                     bool(np.isnan(o["k_norm_model"]).all()),
+                     "its default rung is not an output")
     bad += not check("a standing split with the table is one event, not one per tick",
                      sum(e["code"] == "shadow_disagree" for e in arb.events) == 1)
     tab.own.level[2] = 2                          # the person presses HIGH
     arb.poll(1.0, "contact")
     bad += not check("a press takes the axis back", arb.level[2] == 2)
+    o = arb.opinions()
+    bad += not check("  ... which the step records as the person's, at their level",
+                     o["k_source"][2] == arb.PERSON and o["k_level_human"][2] == 2)
+    bad += not check("  ... with what the model went on wanting beside it",
+                     o["k_level_model"][2] == 0,
+                     "the event says when they parted; this says for how long")
     tk = [e for e in arb.events if e["code"] == "takeover"]
     bad += not check("the takeover keeps what the MODEL wanted beside it",
                      len(tk) == 1 and tk[0]["human"] == 2 and tk[0]["model"] == 0
@@ -264,10 +288,62 @@ def main() -> int:
     arb.poll(1.0 + arb.HOLD + 0.1, "contact")
     bad += not check(f"  ... and gives it back after {arb.HOLD} s of silence",
                      arb.level[2] == 0)
+    o = arb.opinions()
+    bad += not check("  ... when the step is the model's again, and the person's level "
+                     "is where they left it",
+                     o["k_source"][2] == arb.MODEL and o["k_level_human"][2] == 2)
     r = arb.record()
     bad += not check("the counts reach the episode record",
                      r["takeovers"] == 1 and r["disagreements"] == 1
                      and len(r["events"]) >= 2)
+
+    # ---- the output applied as it is, not snapped --------------------------------
+    # `--helper-output continuous`.  The rung is what every arm shares, so it stays the
+    # default; this is the other thing a helper's number can be used for, and it only
+    # ever applies to an axis the MODEL is driving at that step.
+    class _Lad:
+        xy, z, kr = LADDERS["xy"], LADDERS["z"], LADDERS["kr"]
+        def k(self, lv): return np.array([self.xy[lv[0]], self.xy[lv[0]], self.z[lv[1]]])
+        def k_r(self, lv): return float(self.kr[lv[2]])
+
+    def _driven(output):
+        t3 = _Tab()
+        u = HU.HelperUser(StubSim(), None, Levels, t3, version="v0",
+                          axes=("t", "n", "r"), output=output)
+        u.reset()
+        u._own_prev = list(t3.own.level)
+        return u, t3
+
+    cont, tab3 = _driven("continuous")
+    cont.poll(0.0, "contact")
+    k0, kr0 = cont.stiffness(_Lad())
+    bad += not check("a model that has not run yet is given the rung, not a guess",
+                     np.allclose(k0, [1000.0, 1000.0, 600.0]) and kr0 == 3.0,
+                     f"{k0} {kr0}")
+    cont.helper.k_norm, cont.helper.level = np.array([0.30, 0.60, 0.45]), [0, 1, 1]
+    cont.helper.n_calls = 1
+    cont.poll(0.1, "contact")
+    want = cont.helper.ks.expand(cont.helper.k_norm)
+    k1, kr1 = cont.stiffness(_Lad())
+    bad += not check("continuous: the robot is given the model's own number",
+                     np.allclose(k1, [want[0], want[0], want[1]]) and abs(kr1 - want[2]) < 1e-9
+                     and not np.isclose(k1[0], 500.0) and not np.isclose(k1[2], 600.0),
+                     f"asked {np.round(k1, 1)} / {kr1:.2f}, rungs would be 500, 600, 3")
+    bad += not check("  ... while the level it reports is still the nearest rung",
+                     cont.level == [0, 1, 1] and cont.record()["output"] == "continuous")
+    tab3.own.level[2] = 2                         # the person presses K_R high
+    cont.poll(0.2, "contact")
+    k2, kr2 = cont.stiffness(_Lad())
+    bad += not check("  ... and an axis the person holds is theirs, on the ladder",
+                     kr2 == 30.0 and np.allclose(k2, k1), f"K_R {kr2}")
+    snap, _ = _driven("level")
+    snap.helper.k_norm, snap.helper.level = np.array([0.30, 0.60, 0.45]), [0, 1, 1]
+    snap.helper.n_calls = 1
+    snap.poll(0.1, "contact")
+    k3, kr3 = snap.stiffness(_Lad())
+    bad += not check("level, the default: the same output is given as its rung",
+                     np.allclose(k3, [500.0, 500.0, 600.0]) and kr3 == 3.0
+                     and snap.record()["output"] == "level", f"{k3} {kr3}")
 
     # ---- the latched hand ------------------------------------------------------
     # The state machine a person drives the pad with.  It cannot be tried here (it needs
@@ -344,6 +420,25 @@ def main() -> int:
     sp.poll(0.0, "contact")
     bad += not check("the table owns its axes and the person owns theirs",
                      sp.level == [0, 0, 2], f"{sp.level}")
+    # with no model at all the same five series are written, so generation 0 reads the
+    # way every later one does
+    ns_w = {"np": np}
+    exec(WHO_SRC, ns_w)
+    o = ns_w["opinions"](sp)
+    bad += not check("without a model a step still says who set each axis",
+                     list(o["k_source"]) == [0, 0, 1]
+                     and list(o["k_level_human"]) == [2, 2, 2]
+                     and list(o["k_level_table"]) == [0, 0, 0]
+                     and list(o["k_level_model"]) == [-1, -1, -1]
+                     and set(o) == set(ns_w["WHO"]))
+    o = ns_w["opinions"](auto)
+    bad += not check("  ... and a table alone is the table, with nobody at the sticks",
+                     list(o["k_source"]) == [0, 0, 0]
+                     and list(o["k_level_human"]) == [-1, -1, -1])
+    row = ns_w["who_row"]({})
+    bad += not check("a loop that never asked records that nobody said anything",
+                     set(row) == set(ns_w["WHO"]) and list(row["k_source"]) == [-1] * 3
+                     and bool(np.isnan(row["k_norm_model"]).all()))
 
     # ---- lint: the paths this suite cannot run --------------------------------
     # The viewer path is one of them, and that is where a key map referenced the axis

@@ -1,0 +1,3 @@
+# regenerable from seeds with protocol.py
+demos/
+__pycache__/

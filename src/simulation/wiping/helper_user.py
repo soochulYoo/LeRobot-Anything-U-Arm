@@ -94,14 +94,28 @@ class HelperUser:
     """
 
     AXES = {"t": 0, "n": 1, "r": 2}
+    # who set an axis's level on a given step, as the recorder writes it: see `opinions`
+    TABLE, PERSON, MODEL = 0, 1, 2
+
+    OUTPUTS = ("level", "continuous")
 
     def __init__(self, sim, ckpt: str | None, levels, table, version: str = "v1",
-                 hz: float = 10.0, axes=("r",)):
+                 hz: float = 10.0, axes=("r",), kspec=None, output: str = "level"):
+        # WHAT THE ROBOT IS GIVEN ON AN AXIS THE MODEL DRIVES.  "level" snaps the output
+        # to the protocol's ladder -- see the module docstring for why that is the
+        # default: every arm then differs only in who chose the rung.  "continuous"
+        # applies the output itself.  See `stiffness`.
+        if output not in self.OUTPUTS:
+            raise ValueError(f"output {output!r}: one of {self.OUTPUTS}")
+        self.output = output
+        # `kspec` is the envelope the checkpoint's logs were normalised with, and it is
+        # the TASK's: ../peg passes its own.  Expanding a peg model's output through
+        # the pad's envelope would name a different stiffness for every number it says.
         from stiffness_helper.adapters.wiping import WIPING_KSPEC
         from stiffness_helper.deploy import LevelHelper, downsample
         self.sim = sim
         self._down = downsample
-        self.helper = LevelHelper(ckpt, kspec=WIPING_KSPEC, hz=hz, version=version,
+        self.helper = LevelHelper(ckpt, kspec=kspec or WIPING_KSPEC, hz=hz, version=version,
                                  ladders=(tuple(levels.xy), tuple(levels.z),
                                           tuple(levels.kr)))
         self.ckpt = None if ckpt is None else str(ckpt)
@@ -125,6 +139,7 @@ class HelperUser:
         self._own_prev = None
         self._dis_since = {i: None for i in self.axes}
         self._dis_open = {i: False for i in self.axes}
+        self._source = [self.TABLE] * 3
         self.events: list = []
 
     # ---- the interface run_episode uses --------------------------------------
@@ -136,6 +151,7 @@ class HelperUser:
         self._own_prev = None
         self._dis_since = {i: None for i in self.axes}
         self._dis_open = {i: False for i in self.axes}
+        self._source = [self.TABLE] * 3
         self.events = []
 
     @property
@@ -154,7 +170,7 @@ class HelperUser:
         """
         if t < self.helper.t_next:
             return
-        from stiffness_helper.geometry import R_to_quat
+        from stiffness_helper.geometry import R_to_quat, frame_quat
         o = self.sim.observe(images=True)
         top = self._down(_np(o["rgb_top_camera"]))
         side = self._down(_np(o["rgb_wrist_camera"]))
@@ -162,7 +178,7 @@ class HelperUser:
         k_applied = np.array([0.5 * (kd[0] + kd[1]), kd[2], float(_np(rec["kr"]))])
         self.helper.step(
             t, p=_np(rec["p"]), quat=R_to_quat(_np(rec["R"])), v=_np(rec["v"]),
-            x_d=_np(rec["x_d"]), quat_d=R_to_quat(_np(self.sim.W)),
+            x_d=_np(rec["x_d"]), quat_d=frame_quat(_np(self.sim.W)),
             x_m=_np(rec["x_m"]), f_contact=_np(rec["f_filt"]),
             k_applied=k_applied, top=top, side=side)
 
@@ -196,6 +212,10 @@ class HelperUser:
         auto = getattr(self._table, "auto", None)        # the protocol table
         own_lvl = list(own.level) if own is not None else None
         new = list(self._table.level)
+        # On the axes the model does not own the table's merge stands: the person's
+        # level where the axis is theirs, the protocol's where it is not.
+        mine = tuple(getattr(self._table, "axes", ())) if own is not None else ()
+        src = [self.PERSON if i in mine else self.TABLE for i in range(3)]
 
         for i in self.axes:
             model = int(self.helper.level[i])
@@ -212,6 +232,7 @@ class HelperUser:
             else:
                 self._held[i] = None
                 new[i] = model
+            src[i] = self.PERSON if held else self.MODEL
 
             # (2) the standing second opinion is the PROTOCOL TABLE, not the person's
             #     last keypress: a level nobody chose is not an opinion.  A split that
@@ -232,9 +253,74 @@ class HelperUser:
                                phase=group, held=held)
 
         self._own_prev = own_lvl
+        self._source = src
         changed = new != self._level
         self._level = new
         return changed
+
+    def stiffness(self, levels):
+        """-> (k along (u, v, n), k_r): what the controller is ramped toward this step.
+
+        With `output="level"` it is the ladder's value at `self.level`, as it is for
+        every other user.  With `output="continuous"` an axis the MODEL is driving gets
+        the model's own number instead -- its 0-1 output expanded through the task's
+        envelope, which is where the ladder's rungs came from before they were snapped
+        -- so the robot can be given a stiffness between two rungs, or outside the
+        outer ones.  An axis the person holds, or one the table owns, stays on the
+        ladder: a person presses rungs, and the table is rungs.
+
+        `self.level` does not change meaning: it is still the nearest rung, which is
+        what the compliance score and the level read-out are about.  The stiffness
+        that was asked for is in the log as `k_req` / `kr_req`, as it always was.
+        """
+        k = np.asarray(levels.k(self._level), dtype=float)
+        kr = float(levels.k_r(self._level))
+        if self.output == "continuous" and self.helper.n_calls > 0:
+            k_t, k_n, k_r = self.helper.ks.expand(self.helper.k_norm)
+            if self._source[0] == self.MODEL:
+                k[0] = k[1] = float(k_t)
+            if self._source[1] == self.MODEL:
+                k[2] = float(k_n)
+            if self._source[2] == self.MODEL:
+                kr = float(k_r)
+        return k, kr
+
+    def opinions(self) -> dict:
+        """WHAT EACH OF THE THREE WANTED ON THIS STEP, and whose level the robot got.
+
+        `k_level` is the level that was applied, and on an axis the model owns that is
+        the model's -- unless the person pressed within the last HOLD seconds, when it
+        is theirs.  One number cannot be taken apart afterwards: a log of it alone does
+        not say what the model asked for while the person held the axis, nor where the
+        person's own stick stood while the model drove.  The takeover EVENTS say when
+        the two parted, not what each went on wanting.  So all three go into every
+        step, beside the level that won:
+
+            k_level_human   where the person's own keys and sticks stand, -1 with no
+                            person.  It is a standing level, moved one rung per push
+                            from where THEY last left it -- not from what the robot has
+            k_level_model   the rung the model's output snapped to, on all three axes,
+                            owned or not.  MID before its first forward pass, which is
+                            what the robot is given until then
+            k_norm_model    that output itself, 0-1 in the task's envelope; NaN until
+                            the first forward pass, so the default above cannot be
+                            mistaken for something the model said
+            k_level_table   the protocol's table, a reaction time late
+            k_source        whose level was applied: 0 table, 1 person, 2 model
+
+        Read `k_level_human` together with `k_source`: where the source is the model,
+        the person's level is where their stick was left, which nobody need have chosen.
+        """
+        own = getattr(self._table, "own", None)
+        auto = getattr(self._table, "auto", self._table)
+        ran = self.helper.n_calls > 0
+        return dict(
+            k_level_human=np.array(own.level if own is not None else [-1, -1, -1]),
+            k_level_model=np.array([int(v) for v in self.helper.level]),
+            k_norm_model=(np.asarray(self.helper.k_norm, dtype=np.float32) if ran
+                          else np.full(3, np.nan, np.float32)),
+            k_level_table=np.array(auto.level),
+            k_source=np.array(self._source))
 
     def _note(self, t: float, code: str, axis: int, **kw) -> None:
         if len(self.events) >= self.MAX_EVENTS:
@@ -246,7 +332,7 @@ class HelperUser:
         """What goes in the episode's `operator` attribute, so a log says what drove it."""
         ev = self.events
         return dict(skill=f"helper-{self.version}", helper=self.version,
-                    ckpt=self.ckpt, hz=self.hz,
+                    ckpt=self.ckpt, hz=self.hz, output=self.output,
                     axes=[a for a, i in self.AXES.items() if i in self.axes],
                     calls=int(self.helper.n_calls),
                     takeovers=sum(e["code"] == "takeover" for e in ev),

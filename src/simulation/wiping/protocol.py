@@ -242,6 +242,57 @@ class Compliance(WP.Compliance):
 
 
 # --------------------------------------------------------------------------- #
+# WHO WANTED WHAT.  `k_level` is the level the robot was given.  These five say, for the
+# same step, where the person's own controls stood, what the model asked for, what the
+# protocol's table said, and which of the three was applied on each axis.  They are
+# written in EVERY arrangement -- a person alone, a table alone, a model over both -- so
+# a generation collected with a model reads the same way as the one collected without.
+WHO = ("k_level_human", "k_level_model", "k_level_table", "k_norm_model", "k_source")
+SRC_TABLE, SRC_PERSON, SRC_MODEL = 0, 1, 2
+_NOBODY = np.full(3, -1)
+_UNSAID = np.full(3, np.nan, np.float32)
+
+
+def opinions(user) -> dict:
+    """-> the five `WHO` series for this step, whatever `user` is.
+
+    A helper answers for itself (`helper_user.HelperUser.opinions`, where the fields are
+    described).  Without one there is no model: a `SplitLevels` is the person on their
+    axes and the table on the rest, and anything else is a table alone.
+    """
+    if hasattr(user, "opinions"):
+        return user.opinions()
+    own, auto = getattr(user, "own", None), getattr(user, "auto", None)
+    if own is not None and auto is not None:
+        mine = tuple(getattr(user, "axes", ()))
+        return dict(k_level_human=np.array(own.level), k_level_model=_NOBODY,
+                    k_norm_model=_UNSAID, k_level_table=np.array(auto.level),
+                    k_source=np.array([SRC_PERSON if i in mine else SRC_TABLE
+                                       for i in range(3)]))
+    return dict(k_level_human=_NOBODY, k_level_model=_NOBODY, k_norm_model=_UNSAID,
+                k_level_table=np.array(user.level), k_source=np.full(3, SRC_TABLE))
+
+
+def stiffness(user, levels):
+    """-> (k along (u, v, n), k_r) the controller is ramped toward this step.
+
+    The ladder's value at the user's level -- except a helper told to apply its output
+    as it is (`--helper-output continuous`), which answers for the axes it is driving.
+    """
+    if hasattr(user, "stiffness"):
+        return user.stiffness(levels)
+    return levels.k(user.level), levels.k_r(user.level)
+
+
+def who_row(rec) -> dict:
+    """The `WHO` series out of a step record, typed for the log.  A loop that never
+    asked (`teleop.run_synthetic`) records that nobody said anything."""
+    none = dict(k_norm_model=_UNSAID)
+    return {k: np.asarray(rec.get(k, none.get(k, _NOBODY)),
+                          dtype=np.float32 if k == "k_norm_model" else np.int32)
+            for k in WHO}
+
+
 class WipeRecorder(CO.Recorder):
     """`../writing/collect.py`'s Recorder, plus what only wiping has.
 
@@ -251,7 +302,7 @@ class WipeRecorder(CO.Recorder):
     it, it sees the board.
     """
 
-    EXTRA_FULL = ("kr", "kr_req", "n_gone", "mis", "ask")
+    EXTRA_FULL = ("kr", "kr_req", "n_gone", "mis", "ask") + WHO
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -261,6 +312,8 @@ class WipeRecorder(CO.Recorder):
     def on_step(self, i, rec, sess, wr=None) -> None:
         super().on_step(i, rec, sess, wr)
         if i % self.every == 0:
+            for k, v in who_row(rec).items():
+                self.full[k].append(v)
             self.full["kr"].append(np.float32(rec["kr"]))
             self.full["kr_req"].append(np.float32(rec.get("kr_req", rec["kr"])))
             self.full["n_gone"].append(np.int32(self.sim.gone.sum()))
@@ -301,11 +354,18 @@ def case_name(text: str, board: str) -> str:
     return f"{WP.case_name(text)}_{board}"
 
 
-def episode_spec(text: str, case: int, attempt: int, base: int):
+def episode_spec(text: str, case: int, attempt: int, base: int, letter=None):
     """Randomization for one attempt: the board pose, the glyph's size and
-    placement and the operator vary; the text and the board's SHAPE do not."""
+    placement and the operator vary; the text and the board's SHAPE do not.
+
+    `letter` fixes the glyph's height instead of sampling it.  The sampled glyph
+    is 30-40 mm tall and the pad is up to 80 mm across, so the whole of it fits
+    under the pad and a press with no travel takes it off: nothing has to be
+    wiped.  Everything else the seed draws is kept."""
     seed = base + 1000 * case + attempt
     spec = dataclasses.replace(SM.TaskSpec.sample(seed), text=text)
+    if letter:
+        spec = dataclasses.replace(spec, letter_height=letter)
     return spec, WT.WiperStyle.sample(seed), seed
 
 
@@ -399,8 +459,19 @@ class Console:
                     k_req=[float(k_cmd[0]), float(k_cmd[2]), float(kr_cmd)],
                     rtf=round(float(rtf), 2), left=int((~sim.gone).sum()),
                     down=bool(sim.last["pen_down"]), helper=self.helper_out(user),
-                    alpha=round(alpha, 3),
+                    who=self.who(user), alpha=round(alpha, 3),
                     gated=round(self.gated / max(1, self.frames), 4))
+
+    @staticmethod
+    def who(user):
+        """Where the person's own controls stand, what the table says, and whose level
+        each axis has -- the three of `opinions` the page does not already get from
+        `helper_out`.  A stick push moves the PERSON'S level one rung, not the robot's,
+        so with a model driving they have to be able to see where theirs was left."""
+        o = opinions(user)
+        return dict(human=[int(v) for v in o["k_level_human"]],
+                    table=[int(v) for v in o["k_level_table"]],
+                    source=[int(v) for v in o["k_source"]])
 
     @staticmethod
     def helper_out(user):
@@ -420,6 +491,7 @@ class Console:
         ev = getattr(user, "events", [])
         held = [i for i, v in getattr(user, "_held", {}).items() if v is not None]
         return dict(v=getattr(user, "version", "?"),
+                    output=getattr(user, "output", "level"),
                     axes=[int(a) for a in getattr(user, "axes", ())],
                     k_norm=[round(float(x), 3) for x in h.k_norm],
                     lvl=[int(v) for v in h.level], calls=int(h.n_calls),
@@ -620,7 +692,8 @@ def arm_user(sim, levels, args, arm: str, table):
         # reduces to on this rig.
         ckpt = args.ckpt_v0 if arm == "v0" else args.ckpt_v1
         _HELPERS[arm] = HU.HelperUser(sim, ckpt, levels, table, version=arm,
-                                      axes=tuple(args.helper_axes))
+                                      axes=tuple(args.helper_axes),
+                                      output=getattr(args, "helper_output", "level"))
     u = _HELPERS[arm]
     u.reset()
     return u, dict(u.record(), arm=arm)
@@ -652,7 +725,8 @@ def tiered(sim, style, seed: int, levels, args):
             _HELPER_USER = HU.HelperUser(sim, args.helper, levels,
                                          helper_table(args, seed),
                                          version=args.helper_version or "v1",
-                                         axes=tuple(args.helper_axes))
+                                         axes=tuple(args.helper_axes),
+                                         output=getattr(args, "helper_output", "level"))
         _HELPER_USER.reset()
         return style, _HELPER_USER, _HELPER_USER.record()
     if not getattr(args, "scripted", None):
@@ -784,12 +858,13 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
             f_h, _ = wr.act(sim.t, sess.x_m, sess.v_m, sess.f_fb, sim.last["p"])
             # the level change ramps, like a muscle; the tank pays for both
             a_ramp = min(1.0, dt / args.ramp)
-            k_cmd = k_cmd + (levels.k(user.level) - k_cmd) * a_ramp
-            kr_cmd = kr_cmd + (levels.k_r(user.level) - kr_cmd) * a_ramp
+            k_want, kr_want = stiffness(user, levels)
+            k_cmd = k_cmd + (k_want - k_cmd) * a_ramp
+            kr_cmd = kr_cmd + (kr_want - kr_cmd) * a_ramp
             comp.step(sim.t, group, user.level)
             rec = sess.step(f_h, k_cmd, kr_cmd)
             rec.update(phase=T.PHASES.index(wr.phase), stroke=wr.k,
-                       k_level=np.array(user.level))
+                       k_level=np.array(user.level), **opinions(user))
             # A helper sees EXACTLY what the recorder logs -- the same `rec` -- so what it
             # is given at run time cannot drift from what it was trained on.  Anything
             # else is a `user` and ignores this.
@@ -821,6 +896,15 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
                     last_frame = sim.t
                     con.frame(sim)
     if aborted:
+        return None
+    if i == 0:
+        # DONE BEFORE THE FIRST STEP IS A PASS.  The console marks a demo as recording
+        # the moment COLLECT is pressed, while this process may still be loading, so a
+        # DONE pressed in that wait is queued behind the COLLECT and is the first thing
+        # the loop reads -- on an iteration that has not stepped yet.  Nothing was
+        # recorded, so saving raised KeyError in the recorder, killed the collector and
+        # left a zero-frame ep_*.h5 behind for the importer to trip over.
+        print("\n[done before anything was recorded: discarded]")
         return None
     res = sim.score()
     res["finished"] = bool(wr.done)
@@ -900,7 +984,7 @@ def _run_job(job) -> dict:
     c, text, attempt, args = job
     apply_protocol(args)                  # `spawn` re-imported this module
     levels = Levels(xy=tuple(args.k_xy), z=tuple(args.k_z), kr=tuple(args.k_r))
-    spec, style, seed = episode_spec(text, c, attempt, args.seed_base)
+    spec, style, seed = episode_spec(text, c, attempt, args.seed_base, args.letter)
     style, user, operator = tiered(_SIM, style, seed, levels, args)
     rec = WipeRecorder(_SIM, images=not args.no_cameras,
                        video_every=2 if attempt < args.video else 0)
@@ -949,6 +1033,11 @@ def main() -> None:
                     help="which axes the helper owns; the rest keep following the table. "
                          "Default r alone: that is the axis the tier sweep measured this "
                          "task to be decided by")
+    ap.add_argument("--helper-output", choices=("level", "continuous"), default="level",
+                    help="what the robot is given on an axis the helper drives: its "
+                         "output snapped to the nearest level (the default, so that "
+                         "every arm differs only in who chose the level), or the "
+                         "output itself, expanded through the task's envelope")
     ap.add_argument("--attempts", type=int, default=None,
                     help="stop a case after this many attempts, kept or not.  A tier "
                          "whose demos mostly FAIL would otherwise never finish: "
@@ -992,6 +1081,9 @@ def main() -> None:
                     help="announce the arm: for a rehearsal, never for a real session")
     ap.add_argument("--time-limit", type=float, default=None,
                     help="override the spec's 90 s; a hand is slower than the wiper")
+    ap.add_argument("--letter", type=float, default=None,
+                    help="glyph height in m, instead of the sampled 0.030-0.040, "
+                         "which fits under a 40 mm pad whole: 0.15 has to be wiped")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--video", type=int, default=0)
@@ -1155,7 +1247,8 @@ def main() -> None:
     try:
         while (c := next_case()) is not None:
             text = args.texts[c]
-            spec, style, seed = episode_spec(text, c, attempt[c], args.seed_base)
+            spec, style, seed = episode_spec(text, c, attempt[c], args.seed_base,
+                                             args.letter)
             if args.time_limit:
                 spec = dataclasses.replace(spec, time_limit=args.time_limit)
             operator = None
@@ -1240,6 +1333,8 @@ def main() -> None:
             row["attempt"] = attempt[c]
             row["arm"] = (operator or {}).get("arm")
             row["calls"] = (operator or {}).get("calls")
+            # how a helper's output reached the robot: snapped to a level, or as it is
+            row["helper_output"] = (operator or {}).get("output")
             row["motion"] = args.motion
             # COUNT WHAT IS ON DISK, which is how `done` was INITIALISED: by globbing
             # ep_*.h5.  Incrementing on `keep` instead meant that with --keep-failed
