@@ -97,14 +97,17 @@ class HelperUser:
     # who set an axis's level on a given step, as the recorder writes it: see `opinions`
     TABLE, PERSON, MODEL = 0, 1, 2
 
-    OUTPUTS = ("level", "continuous")
+    OUTPUTS = ("level", "level5", "continuous")
 
     def __init__(self, sim, ckpt: str | None, levels, table, version: str = "v1",
                  hz: float = 10.0, axes=("r",), kspec=None, output: str = "level"):
         # WHAT THE ROBOT IS GIVEN ON AN AXIS THE MODEL DRIVES.  "level" snaps the output
         # to the protocol's ladder -- see the module docstring for why that is the
         # default: every arm then differs only in who chose the rung.  "continuous"
-        # applies the output itself.  See `stiffness`.
+        # applies the output itself, and "level5" snaps it to five rungs instead of
+        # three -- the ladder's own, and the two that lie half way between them -- which
+        # is the middle term of the question "how finely does the output need applying".
+        # See `stiffness`.
         if output not in self.OUTPUTS:
             raise ValueError(f"output {output!r}: one of {self.OUTPUTS}")
         self.output = output
@@ -275,8 +278,11 @@ class HelperUser:
         """
         k = np.asarray(levels.k(self._level), dtype=float)
         kr = float(levels.k_r(self._level))
-        if self.output == "continuous" and self.helper.n_calls > 0:
+        if self.output != "level" and self.helper.n_calls > 0:
             k_t, k_n, k_r = self.helper.ks.expand(self.helper.k_norm)
+            if self.output == "level5":
+                k_t, k_n, k_r = (self._five(v, lad) for v, lad in
+                                 ((k_t, levels.xy), (k_n, levels.z), (k_r, levels.kr)))
             if self._source[0] == self.MODEL:
                 k[0] = k[1] = float(k_t)
             if self._source[1] == self.MODEL:
@@ -284,6 +290,14 @@ class HelperUser:
             if self._source[2] == self.MODEL:
                 kr = float(k_r)
         return k, kr
+
+    @staticmethod
+    def _five(value: float, ladder) -> float:
+        """`value` on the nearest of FIVE rungs: the ladder's three and the two half way
+        between, all in log space, which is the space the ladder is even in."""
+        lo, mid, hi = (float(v) for v in ladder)
+        rungs = np.array([lo, np.sqrt(lo * mid), mid, np.sqrt(mid * hi), hi])
+        return float(rungs[np.argmin(np.abs(np.log(max(float(value), 1e-9)) - np.log(rungs)))])
 
     def opinions(self) -> dict:
         """WHAT EACH OF THE THREE WANTED ON THIS STEP, and whose level the robot got.

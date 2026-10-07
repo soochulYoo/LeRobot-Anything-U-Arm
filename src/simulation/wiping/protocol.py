@@ -201,6 +201,122 @@ class AutoUser(WP.AutoUser):
         return False
 
 
+# --------------------------------------------------------------------------- #
+# THE TWO THINGS A TASK HAS TO SHOW before a schedule on it means anything.
+#
+#   MAGNITUDE   one stiffness held for the whole episode fails -- low, and high.  If a
+#               constant does the task, a helper that changes the stiffness has learned
+#               nothing a dial could not hold.
+#   TIMING      the table's own switches, moved earlier or later, fail.  If the moment
+#               does not matter, predicting it is not a skill.
+#
+# `HoldUser` is the first and `ShiftedLevels` the second.  Both are users like any
+# other -- `reset`, `poll(t, group)`, `.level` -- so the episode loop cannot tell.
+class HoldUser:
+    """One set of levels for the whole episode."""
+
+    def __init__(self, level):
+        self._hold = [int(v) for v in level]
+        self.level = list(self._hold)
+
+    def reset(self) -> None:
+        self.level = list(self._hold)
+
+    def poll(self, t: float, group: str) -> bool:
+        return False
+
+
+class RecordedLevels:
+    """A user, with WHEN it changed level kept: `schedule` is [(t, level), ...]."""
+
+    def __init__(self, user):
+        self.user = user
+        self.schedule: list = []
+
+    @property
+    def level(self):
+        return self.user.level
+
+    def reset(self) -> None:
+        self.user.reset()
+        self.schedule = [(-1e9, list(self.user.level))]
+
+    def poll(self, t: float, group: str) -> bool:
+        changed = bool(self.user.poll(t, group))
+        if changed:
+            self.schedule.append((float(t), list(self.user.level)))
+        return changed
+
+
+class ShiftedLevels:
+    """A recorded schedule played back `shift` seconds LATE (negative: early).
+
+    Played back by the clock, not by the phase: an early switch has to happen before
+    the event it belongs to, and nothing in the loop knows that event is coming.  So
+    the schedule is taken from a reference pass of the SAME episode -- same board, same
+    hand, the table switching the instant each phase begins -- and replayed.  The
+    second pass is not the first once the stiffness differs, so the offset actually
+    realised is measured from the log and not assumed.
+
+
+    ONE AXIS AT A TIME, when asked.  `axes` are the axes that take the shift; the rest
+    are played back on time.  `pin` holds an axis at one level whatever the schedule
+    says.  Moving all three together says whether timing matters; moving one says WHICH
+    axis's timing matters, which is the question a rule for that axis has to answer.
+    """
+
+    def __init__(self, schedule, shift: float, axes=None, pin=None):
+        self.schedule = [(float(t), list(lv)) for t, lv in schedule]
+        self.shift = float(shift)
+        n = len(self.schedule[0][1])
+        self.axes = tuple(range(n)) if axes is None else tuple(axes)
+        self.pin = dict(pin or {})
+        self.reset()
+
+    def _at(self, t: float, i: int) -> int:
+        while i + 1 < len(self.schedule) and t >= self.schedule[i + 1][0]:
+            i += 1
+        return i
+
+    def _mix(self) -> list:
+        late, now = self.schedule[self._i][1], self.schedule[self._j][1]
+        lv = [late[a] if a in self.axes else now[a] for a in range(len(now))]
+        for a, v in self.pin.items():
+            lv[a] = int(v)
+        return lv
+
+    def reset(self) -> None:
+        self._i = self._j = 0             # the shifted cursor, and the one on time
+        self.level = self._mix()
+
+    def poll(self, t: float, group: str) -> bool:
+        self._i = self._at(t - self.shift, self._i)
+        self._j = self._at(t, self._j)
+        new = self._mix()
+        changed = new != self.level
+        self.level = new
+        return changed
+
+
+def shifted_user(run, seed: int, args, auto=None):
+    """--shift S -> (user, operator record), after one reference pass.
+
+    `run(user)` runs the episode with that user and records nothing; it is this
+    module's `run_episode` with everything but the user already bound, or another
+    task's.  `auto` is that task's table-follower class.
+    """
+    ref = RecordedLevels((auto or AutoUser)(seed, (0.0, 0.0)))
+    run(ref)
+    names = {"t": 0, "n": 1, "r": 2}
+    axes = getattr(args, "shift_axes", None)
+    pin = {names[a]: int(v) for a, v in (x.split("=") for x in getattr(args, "pin", None) or ())}
+    return (ShiftedLevels(ref.schedule, args.shift,
+                          None if not axes else [names[a] for a in axes], pin),
+            dict(skill=f"table{args.shift:+.2f}s", shift=float(args.shift),
+                 shift_axes=list(axes or names), pin=pin,
+                 switches=[(round(t, 3), lv) for t, lv in ref.schedule[1:]]))
+
+
 class Compliance(WP.Compliance):
     """The inherited score, against THIS module's table, plus a PER-AXIS breakdown.
 
@@ -702,6 +818,13 @@ def arm_user(sim, levels, args, arm: str, table):
 _HELPER_USER = None            # one per process: torch.load is not cheap
 
 
+def _spec_of(sim, args, seed: int):
+    """The spec `seed` names, for the reference pass of --shift: `tiered` is handed the
+    style and the seed but not the spec, and the seed is the whole of it."""
+    case, attempt = divmod(seed - args.seed_base, 1000)
+    return episode_spec(args.texts[case], case, attempt, args.seed_base, args.letter)[0]
+
+
 def tiered(sim, style, seed: int, levels, args):
     """-> (style, user, operator record): who sets the levels this episode.
 
@@ -714,6 +837,13 @@ def tiered(sim, style, seed: int, levels, args):
                           same levels (helper_user.HelperUser)
         neither           AutoUser on --reaction, as before
     """
+    if getattr(args, "hold", None) is not None:
+        return style, HoldUser(args.hold), dict(skill="fixed", hold=list(args.hold))
+    if getattr(args, "shift", None) is not None:
+        user, operator = shifted_user(
+            lambda u: run_episode(sim, _spec_of(sim, args, seed), style, u, levels, args,
+                                  cues=False), seed, args)
+        return style, user, operator
     if getattr(args, "helper", None):
         global _HELPER_USER
         if _HELPER_USER is None:
@@ -1033,7 +1163,23 @@ def main() -> None:
                     help="which axes the helper owns; the rest keep following the table. "
                          "Default r alone: that is the axis the tier sweep measured this "
                          "task to be decided by")
-    ap.add_argument("--helper-output", choices=("level", "continuous"), default="level",
+    ap.add_argument("--hold", type=int, nargs=3, default=None, metavar=("XY", "Z", "KR"),
+                    help="hold these three levels (0 low, 1 mid, 2 high) for the whole "
+                         "episode: the MAGNITUDE check -- a task a constant can do is "
+                         "not a task for a schedule.  Implies --auto-user")
+    ap.add_argument("--shift", type=float, default=None, metavar="S",
+                    help="the table's own switches, S seconds late (negative: early), "
+                         "replayed from a reference pass of the same episode: the "
+                         "TIMING check.  0 is the table with no reaction time at all.  "
+                         "Implies --auto-user")
+    ap.add_argument("--shift-axes", nargs="+", default=None, choices=("t", "n", "r"),
+                    help="with --shift: only these axes are moved; the rest switch on "
+                         "time.  Default: all three")
+    ap.add_argument("--pin", nargs="+", default=None, metavar="AXIS=LEVEL",
+                    help="with --shift: hold an axis at one level (0 low, 1 mid, 2 high) "
+                         "whatever the table says, e.g. `--pin r=0`")
+    ap.add_argument("--helper-output", choices=("level", "level5", "continuous"),
+                    default="level",
                     help="what the robot is given on an axis the helper drives: its "
                          "output snapped to the nearest level (the default, so that "
                          "every arm differs only in who chose the level), or the "
@@ -1090,8 +1236,10 @@ def main() -> None:
     ap.add_argument("--no-cameras", action="store_true")
     ap.add_argument("--image-size", type=int, default=128)
     args = ap.parse_args()
-    if args.scripted or args.helper:
+    if args.scripted or args.helper or args.hold is not None or args.shift is not None:
         args.auto_user = True        # the tier or the helper sets the levels, not a keyboard
+    if sum(x is not None for x in (args.scripted, args.helper, args.hold, args.shift)) > 1:
+        ap.error("--scripted, --helper, --hold and --shift each set the levels; pick one")
     if args.scripted and args.helper:
         ap.error("--scripted and --helper both set the levels; pick one")
     if args.arms:

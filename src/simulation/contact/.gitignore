@@ -1,0 +1,4 @@
+# regenerable: demos from seeds with protocol.py, the stick's URDF on import
+demos/
+assets/
+__pycache__/
