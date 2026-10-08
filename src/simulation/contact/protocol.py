@@ -642,6 +642,11 @@ def main() -> None:
                     help="stop after this many attempts, kept or not")
     ap.add_argument("--auto-user", action="store_true",
                     help="the table sets every level; nobody presses anything")
+    ap.add_argument("--person-rate", type=float, default=None, metavar="P",
+                    help="a scripted person who acts on a fraction P of the switches "
+                         "the table asks for, so a helper can be taken over without a "
+                         "human in the room.  The fraction of FRAMES they end up owning "
+                         "is an outcome, recorded in `helper/axis_source`, not P")
     ap.add_argument("--reaction", type=float, nargs=2, default=[0.20, 0.45],
                     metavar=("MIN", "MAX"))
     ap.add_argument("--motion", choices=("script", "human", "vr"), default="script",
@@ -666,6 +671,10 @@ def main() -> None:
                     metavar=("ACROSS", "ALONG", "KR"),
                     help="hold these three levels (0 low, 1 mid, 2 high) for the whole "
                          "episode: the MAGNITUDE check")
+    ap.add_argument("--pin", nargs="+", default=None, metavar="AXIS=LEVEL",
+                    help="hold an axis at one level (0 low, 1 mid, 2 high) whatever the "
+                         "table says, e.g. `--pin r=0`.  The unpinned axes keep "
+                         "following the schedule: the PER-AXIS ablation --hold cannot do")
     ap.add_argument("--shift", type=float, default=None, metavar="S",
                     help="the table's own switches, S seconds late (negative: early), "
                          "replayed from a reference pass of the same episode: the "
@@ -719,10 +728,28 @@ def main() -> None:
 
     auto_ax = () if args.auto_axes == ["none"] else tuple(AXIS_OF[a] for a in args.auto_axes)
     person_ax = tuple(i for i in range(3) if i not in auto_ax)
+    _pin = WPR.pin_spec(args)
     if args.hold is not None:
         user = WPR.HoldUser(args.hold)
+    elif args.person_rate is not None:
+        # A SCRIPTED PERSON BESIDE THE TABLE, for the assisted and manual arms.
+        # `HelperUser` reads `table.own` to see a takeover, and a bare `AutoUser` has no
+        # `own`, so without this a headless session can never produce one.  Two
+        # independent AutoUsers: the person and the standing table must be able to
+        # disagree, which they cannot if they are the same object.
+        from stiffness_helper.scripted_person import ScriptedPerson
+        # ONLY THE AXES THE HELPER OWNS -- see wiping/protocol.py's `helper_table`:
+        # giving the throttled person every axis leaves the uncontested ones stuck at
+        # stale levels and the arm stops being about the contested one.
+        own_ax = tuple(AXIS_OF[a] for a in args.helper_axes)
+        user = WPR.SplitLevels(
+            ScriptedPerson(AutoUser(args.seed_base, tuple(args.reaction)),
+                           args.person_rate, args.seed_base),
+            AutoUser(args.seed_base, tuple(args.reaction)), own_ax)
     elif args.auto_user or viewer is None:
         user = AutoUser(args.seed_base, tuple(args.reaction))
+        if _pin:
+            user = WPR.PinnedUser(user, _pin)
     else:
         user = WPR.SplitLevels(WPR.KeyboardLevels(viewer.window),
                                AutoUser(args.seed_base, tuple(args.reaction)), person_ax)

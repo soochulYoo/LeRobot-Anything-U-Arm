@@ -226,6 +226,39 @@ class HoldUser:
         return False
 
 
+class PinnedUser:
+    """Another user with some axes HELD, the rest left to whoever it wraps.
+
+    `--hold` fixes all three axes at once, so it answers "can a constant do this task"
+    and nothing finer.  The question a per-axis ablation asks is different -- can THIS
+    axis be a constant while the others still follow the table -- and that needs the
+    schedule left running underneath.  `ShiftedLevels` already took a `pin` for the same
+    reason on the timing side; this is that, for the plain schedule.
+    """
+
+    def __init__(self, inner, pin):
+        self.inner, self.pin = inner, {int(a): int(v) for a, v in dict(pin).items()}
+        self.reset()
+
+    def _mix(self) -> list:
+        lv = list(self.inner.level)
+        for a, v in self.pin.items():
+            lv[a] = v
+        return lv
+
+    def reset(self) -> None:
+        self.inner.reset()
+        self.level = self._mix()
+
+    def poll(self, t: float, group: str) -> bool:
+        changed = self.inner.poll(t, group)
+        self.level = self._mix()
+        return changed
+
+    def __getattr__(self, k):            # opinions(), own, anything else the loop reads
+        return getattr(self.__dict__["inner"], k)
+
+
 class RecordedLevels:
     """A user, with WHEN it changed level kept: `schedule` is [(t, level), ...]."""
 
@@ -298,6 +331,15 @@ class ShiftedLevels:
         return changed
 
 
+AXIS_NAMES = {"t": 0, "n": 1, "r": 2}
+
+
+def pin_spec(args) -> dict:
+    """--pin r=0 -> {2: 0}."""
+    return {AXIS_NAMES[a]: int(v)
+            for a, v in (x.split("=") for x in getattr(args, "pin", None) or ())}
+
+
 def shifted_user(run, seed: int, args, auto=None):
     """--shift S -> (user, operator record), after one reference pass.
 
@@ -307,9 +349,9 @@ def shifted_user(run, seed: int, args, auto=None):
     """
     ref = RecordedLevels((auto or AutoUser)(seed, (0.0, 0.0)))
     run(ref)
-    names = {"t": 0, "n": 1, "r": 2}
+    names = AXIS_NAMES
     axes = getattr(args, "shift_axes", None)
-    pin = {names[a]: int(v) for a, v in (x.split("=") for x in getattr(args, "pin", None) or ())}
+    pin = pin_spec(args)
     return (ShiftedLevels(ref.schedule, args.shift,
                           None if not axes else [names[a] for a in axes], pin),
             dict(skill=f"table{args.shift:+.2f}s", shift=float(args.shift),
@@ -755,6 +797,24 @@ def helper_table(args, seed: int):
     keys when a person is there to press them."""
     auto = AutoUser(seed, tuple(args.reaction))
     view = getattr(args, "_viewer", None)
+    rate = getattr(args, "person_rate", None)
+    if rate is not None:
+        # A SCRIPTED PERSON BESIDE THE TABLE, for the assisted and manual arms.
+        # `HelperUser` reads `table.own` to see a takeover, and a bare `AutoUser` has no
+        # `own`, so without this a headless session can never produce one.  Two
+        # independent AutoUsers: the person and the standing table must be able to
+        # disagree, which they cannot if they are the same object.
+        from stiffness_helper.scripted_person import ScriptedPerson
+        # ONLY THE AXES THE HELPER OWNS.  Handing the throttled person every axis was
+        # measured and wrong: a person who declines three switches in four leaves the
+        # axes nobody is comparing stuck at stale levels, and on the pad that showed up
+        # as K_t 983 against the table's 689 and K_R 25.4 against 15.4 -- a stiff wrist
+        # on a curved board, which took `erased` from 0.85 to 0.52.  The arm then was
+        # not "a helper on K_n" but "a helper on K_n and a sluggish operator on the
+        # other two".  The table drives everything the helper was not given.
+        own_ax = tuple(AXIS_OF[a] for a in getattr(args, "helper_axes", ("r",)))
+        return SplitLevels(ScriptedPerson(AutoUser(seed, tuple(args.reaction)),
+                                          rate, seed), auto, own_ax)
     if view is None or getattr(args, "motion", "wiper") == "wiper":
         return auto
     person = getattr(args, "_person_ax", (0, 1, 2))
@@ -860,7 +920,11 @@ def tiered(sim, style, seed: int, levels, args):
         _HELPER_USER.reset()
         return style, _HELPER_USER, _HELPER_USER.record()
     if not getattr(args, "scripted", None):
-        return style, AutoUser(seed, tuple(args.reaction)), None
+        user = AutoUser(seed, tuple(args.reaction))
+        pin = pin_spec(args)
+        if pin:
+            return style, PinnedUser(user, pin), dict(skill="pinned", pin=pin)
+        return style, user, None
     style, sk = WS.apply(style, WS.skill(args.scripted), seed)
     return style, AutoUser(seed, sk.reaction()), dict(
         skill=WS.name(args.scripted),
@@ -1176,8 +1240,11 @@ def main() -> None:
                     help="with --shift: only these axes are moved; the rest switch on "
                          "time.  Default: all three")
     ap.add_argument("--pin", nargs="+", default=None, metavar="AXIS=LEVEL",
-                    help="with --shift: hold an axis at one level (0 low, 1 mid, 2 high) "
-                         "whatever the table says, e.g. `--pin r=0`")
+                    help="hold an axis at one level (0 low, 1 mid, 2 high) whatever "
+                         "the table says, e.g. `--pin r=0`.  Unlike --hold, which fixes "
+                         "all three, the unpinned axes keep following the schedule -- "
+                         "which is what a PER-AXIS ablation needs.  Combines with "
+                         "--shift as before")
     ap.add_argument("--helper-output", choices=("level", "level5", "continuous"),
                     default="level",
                     help="what the robot is given on an axis the helper drives: its "
@@ -1195,6 +1262,11 @@ def main() -> None:
                          "wipe_scripted.SKILLS, or two floats (seeing delay s, level "
                          "reaction s).  Implies --auto-user; the files record the tier "
                          "in their `operator` attribute")
+    ap.add_argument("--person-rate", type=float, default=None, metavar="P",
+                    help="a scripted person who acts on a fraction P of the switches "
+                         "the table asks for, so a helper can be taken over without a "
+                         "human in the room.  The fraction of FRAMES they end up owning "
+                         "is an outcome, recorded in `helper/axis_source`, not P")
     ap.add_argument("--reaction", type=float, nargs=2, default=[0.20, 0.45],
                     metavar=("MIN", "MAX"))
     ap.add_argument("--motion", choices=("wiper", "human", "vr"), default="wiper",
