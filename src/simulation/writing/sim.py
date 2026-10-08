@@ -34,6 +34,8 @@ SUCCESS (Criteria) -- all of:
 """
 from __future__ import annotations
 
+import os
+
 import dataclasses
 import warnings
 from dataclasses import dataclass, field
@@ -145,7 +147,18 @@ class WritingSim:
         self.cameras = cameras
         extra = {} if sim_freq is None else dict(
             sim_config=dict(sim_freq=int(sim_freq), control_freq=int(sim_freq)))
+        # RENDER DEVICE WITH AN INDEX, because ManiSkill asks for one without.  Its
+        # default render_backend is "gpu", which it maps to "sapien_cuda" and then
+        # builds `sapien.Device("cuda")` when no device id was given -- and on this
+        # cluster that raises `failed to find device "cuda"` while `sapien.Device(
+        # "cuda:0")` returns the RTX 3090 happily.  ManiSkill catches the RuntimeError
+        # and falls back to CPU rendering, which is not a degraded mode but an
+        # unusable one: two tasks rasterising 128x128 cameras on llvmpipe ran eight
+        # hours at 350% CPU and produced no episodes at all.  Passing "cuda:0" goes
+        # through `parse_backend_device_id`, which splits it, so the device id arrives.
+        render_backend = os.environ.get("MS_RENDER_BACKEND", "cuda:0")
         self.env = gym.make(self.ENV_ID, num_envs=1, sim_backend="cpu",
+                            render_backend=render_backend,
                             obs_mode="rgb" if cameras else "state",
                             render_mode=render_mode,
                             image_size=image_size, wrist_camera=wrist_camera, **extra)

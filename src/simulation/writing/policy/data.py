@@ -166,7 +166,13 @@ def episode_samples(path, layout: str = "legacy") -> dict:
         kr = o["kr"][:] if "kr" in o else None
         k_level = f["action/k_level"][:] if "k_level" in f["action"] else -np.ones((len(x_d), 2), int)
         top, wrist = _down(o["rgb_top_camera"][:]), _down(o["rgb_wrist_camera"][:])
-        gp = goal_points(f["goal/strokes_world"][:], f["goal/mask"][:])
+        # A TASK WITHOUT A GLYPH still has a goal, it just is not a path: flipping a box
+        # and opening a door record `goal/belief_origin` and `goal/belief_R` and no
+        # strokes.  Zeros keep the channel's width so one `Config` serves every task,
+        # and `--no-goal` is what actually removes it from the model -- which is the
+        # honest way to train these two, since a constant channel teaches nothing.
+        gp = (goal_points(f["goal/strokes_world"][:], f["goal/mask"][:])
+              if "strokes_world" in f["goal"] else np.zeros((G, 2)))
         origin = f["goal/belief_origin"][:]
         W = f["goal/belief_R"][:].astype(np.float64)   # the paper's u, v, n
         case = int(f.attrs.get("case", 0))
