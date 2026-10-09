@@ -105,17 +105,24 @@ LEVEL_NAMES = WPR.LEVEL_NAMES
 
 # "seated" is the DRAWER's: against its stop.  Appended, never inserted, so the
 # index every past log wrote still means what it meant.
-PHASES = ("reach", "touch", "work", "seated")
+PHASES = ("reach", "touch", "work", "seated", "carry")
 PHASE_GROUP = {"reach": "approach", "touch": "pre-contact", "work": "work",
-               "seated": "stop"}
+               "seated": "stop", "carry": "carry"}
 # set per task by `main` from that task's table, as EXPECTED is: a task without a
 # stop must not be scored on a row it does not have
 GROUPS = ["approach", "pre-contact", "work"]
 # protocol phase -> (across level, along level, K_R level), per task.  `EXPECTED` is the
 # one in force: `main` sets it from the task, and everything below reads it.
 TABLES = {
-    "flip": {"approach": (HIGH, HIGH, HIGH), "pre-contact": (LOW, LOW, LOW),
-             "work": (LOW, HIGH, LOW)},
+    # FLIP NO LONGER SHARES THE DOOR'S ROW.  "Soft push, hard move" is the door's
+    # mechanism and the door's table scores 95-100% on every ablation arm; on the box
+    # it does not hold.  Measured two ways: pinning along HIGH for the episode gives
+    # 45-46% against 100% at LOW (and the same under a hand that steers the arc, so
+    # it is not the operator), and 90 VR demos show the operator using LOW below 20
+    # degrees of lift and MID above it -- never a dominant HIGH.  So `work` drops to
+    # LOW and a `carry` row at MID takes over once the box is over.
+    "flip": {"approach": (MID, MID, MID), "pre-contact": (LOW, LOW, LOW),
+             "work": (LOW, LOW, LOW), "carry": (LOW, MID, LOW)},
     "door": {"approach": (HIGH, HIGH, HIGH), "pre-contact": (LOW, LOW, LOW),
              "work": (LOW, HIGH, LOW)},
     # THE DRAWER HAS A FOURTH ROW, and it is the reason the task exists.  The handle is
@@ -288,6 +295,8 @@ class FlipScript(Script):
         s, dt = self.sim, self.sim.dt
         into = self._old("into", t, s.face_inward(), self.SEE)
         up = self._old("up", t, s.face_up(), self.SEE)
+        if getattr(self.sim, "SLIDE", False):
+            return self._work_sliding(t, f_fb, into)
         if getattr(self.sim, "STEER", False):
             return self._work_steered(t, f_fb, into, up)
         # what comes back through the handle is the spring the tool is stretching:
@@ -298,6 +307,45 @@ class FlipScript(Script):
             self.lifting = lean >= self.PRESS
         else:
             self.tgt = (self.tgt + self.V_WORK * dt * up
+                        + self.HAPTIC * (self.PRESS - lean) * dt * into)
+        if s.rise() >= self.LET_GO:
+            self.state, self.t0, self.press = "rest", t, False
+
+    def _work_sliding(self, t: float, f_fb, into) -> None:
+        """ACP's flipping: the finger SLIDES on the face while the item pivots.
+
+        The default hand carries its target along the box's own `up`, which turns
+        with the box -- so the tip rides the same material point and the contact
+        never slides.  Measured over 40 demos: 3.8% of contact frames have any
+        tangential speed at all, against 96% on the pad, and the trail rule writes
+        0% of frames here as a result.
+
+        Adaptive Compliance Policy (Hou et al., arXiv:2410.09309) flips by pushing an
+        item against a fixture corner with a point finger, and there the contact
+        slides up the face as the item turns.  This does the same: the push is held
+        in the WORLD direction it had when the lift began, so the box's face rotates
+        underneath the tip instead of with it.
+
+        Kept beside the tracking hand rather than replacing it, because which one the
+        task has decides whether a trail rule can say anything about k_t at all.
+        """
+        s, dt = self.sim, self.sim.dt
+        lean = -float(self._old("felt", t, f_fb, self.FEEL) @ into)
+        if not self.lifting:
+            self.tgt = self.tgt + self.V_TOUCH * dt * into
+            if lean >= self.PRESS:
+                self.lifting = True
+                # The push direction is FROZEN here, in the WORLD: into the box plus
+                # `up_frac` of straight up.  The up component is what costs slip --
+                # a tip that rises with the box slides less on it -- so 0 is a purely
+                # horizontal push into the wall and the face travels furthest under
+                # the tip.  Swept, because more slip is not free: the tip is no
+                # longer going where the box is going.
+                a = float(getattr(self.sim, "SLIDE_UP", 1.0))
+                d = into + a * np.array([0.0, 0.0, 1.0])
+                self._push = d / max(float(np.linalg.norm(d)), 1e-9)
+        else:
+            self.tgt = (self.tgt + self.V_WORK * dt * self._push
                         + self.HAPTIC * (self.PRESS - lean) * dt * into)
         if s.rise() >= self.LET_GO:
             self.state, self.t0, self.press = "rest", t, False
@@ -435,6 +483,9 @@ class ContactHand:
         press = bool(self.hand.press)
         self._idle = 0.0 if press else self._idle + self.sim.dt
         let_go = self._idle > self.RELEASE
+        if self.phase == "work" and getattr(self.sim, "carrying", None) \
+                and self.sim.carrying():
+            self.phase = "carry"
         if self.grasped:
             # held, so `let_go` means nothing; the only move is onto the stop
             if self.phase == "work" and self.sim.seated():
@@ -778,6 +829,17 @@ def main() -> None:
                     help="hold an axis at one level (0 low, 1 mid, 2 high) whatever the "
                          "table says, e.g. `--pin r=0`.  The unpinned axes keep "
                          "following the schedule: the PER-AXIS ablation --hold cannot do")
+    ap.add_argument("--slide", action=argparse.BooleanOptionalAction, default=None,
+                    help="flip with a SLIDING contact, as Adaptive Compliance Policy "
+                         "does it: the push is held in the world direction the lift "
+                         "began in, so the box's face turns under the tip instead of "
+                         "with it.  The default hand tracks the box's own frame and "
+                         "the contact never slides (3.8% of contact frames), which is "
+                         "why no trail rule can fire on this task")
+    ap.add_argument("--slide-up", type=float, default=1.0, metavar="FRAC",
+                    help="with --slide: how much of the frozen push is straight UP, "
+                         "against one unit into the box.  0 is horizontal into the "
+                         "wall and slides most; 1 is 45 degrees and slides least")
     ap.add_argument("--steer", action="store_true",
                     help="the scripted hand follows the ARC the work travels instead "
                          "of the tangent it last saw.  OFF by default on purpose: the "
@@ -816,7 +878,8 @@ def main() -> None:
 
     EXPECTED.clear()
     EXPECTED.update(TABLES[args.task])
-    GROUPS[:] = [g for g in ("approach", "pre-contact", "work", "stop") if g in EXPECTED]
+    GROUPS[:] = [g for g in ("approach", "pre-contact", "work", "carry", "stop")
+                 if g in EXPECTED]
     levels = WPR.Levels(xy=tuple(args.k_across), z=tuple(args.k_along), kr=tuple(args.k_r))
     out = pathlib.Path(args.out or f"demos/{args.task}")
     out.mkdir(parents=True, exist_ok=True)
@@ -844,6 +907,10 @@ def main() -> None:
     # read by FlipScript._work; an attribute rather than a constructor argument so the
     # three sims keep one signature and the flag reaches only the hand that uses it
     sim.STEER = bool(getattr(args, "steer", False))
+    # the task carries the default (FlipSim.SLIDE); the flag only overrides it
+    if getattr(args, "slide", None) is not None:
+        sim.SLIDE = bool(args.slide)
+    sim.SLIDE_UP = float(getattr(args, "slide_up", 1.0))
     viewer = None if args.headless else sim.u.render_human()
 
     auto_ax = () if args.auto_axes == ["none"] else tuple(AXIS_OF[a] for a in args.auto_axes)

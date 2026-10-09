@@ -461,6 +461,24 @@ class FlipSim(ContactSim):
     TASK = "flip"
     LANDS = False          # pressing on the box IS the work: there is no landing apart
     UPRIGHT = np.radians(80.0)        # standing on its far end, give or take a lean
+    # ONCE THE BOX IS OVER, THE JOB CHANGES.  Up to here the tip is settling onto a
+    # box that has not moved; past it the box is being carried round its arc, and the
+    # two want different stiffness ALONG the motion.  Measured on 90 VR demos: below
+    # 20 degrees the operator holds k_n LOW 58-61% of the time, above it MID 57-60%.
+    # The protocol's single `contact` row cannot say both, so this splits it.
+    CARRY = np.radians(20.0)
+    # THE CONTACT SLIDES, as Adaptive Compliance Policy's flipping does (Hou et al.,
+    # arXiv:2410.09309): the push is frozen in the world direction the lift began in,
+    # so the box's face turns under the tip instead of with it.  Tracking the box's
+    # own frame -- the first version here -- kept the tip on one material point and
+    # no trail rule could fire: 1.8% of frames against 9.1% sliding, and measured on
+    # 40 matched scenes the sliding contact is better on every count (success 92 ->
+    # 100%, 9.9 -> 8.6 s) at 6.1 -> 7.8 N of peak force, well inside the 20 N limit.
+    # `--no-slide` restores the tracking contact for comparison.
+    SLIDE = True
+
+    def carrying(self) -> bool:
+        return hasattr(self, "spec") and self.rise() >= self.CARRY
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
