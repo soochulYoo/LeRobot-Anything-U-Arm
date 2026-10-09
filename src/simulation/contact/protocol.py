@@ -103,8 +103,13 @@ WPR = _wiping_protocol()
 LOW, MID, HIGH = WPR.LOW, WPR.MID, WPR.HIGH
 LEVEL_NAMES = WPR.LEVEL_NAMES
 
-PHASES = ("reach", "touch", "work")
-PHASE_GROUP = {"reach": "approach", "touch": "pre-contact", "work": "work"}
+# "seated" is the DRAWER's: against its stop.  Appended, never inserted, so the
+# index every past log wrote still means what it meant.
+PHASES = ("reach", "touch", "work", "seated")
+PHASE_GROUP = {"reach": "approach", "touch": "pre-contact", "work": "work",
+               "seated": "stop"}
+# set per task by `main` from that task's table, as EXPECTED is: a task without a
+# stop must not be scored on a row it does not have
 GROUPS = ["approach", "pre-contact", "work"]
 # protocol phase -> (across level, along level, K_R level), per task.  `EXPECTED` is the
 # one in force: `main` sets it from the task, and everything below reads it.
@@ -113,6 +118,13 @@ TABLES = {
              "work": (LOW, HIGH, LOW)},
     "door": {"approach": (HIGH, HIGH, HIGH), "pre-contact": (LOW, LOW, LOW),
              "work": (LOW, HIGH, LOW)},
+    # THE DRAWER HAS A FOURTH ROW, and it is the reason the task exists.  The handle is
+    # held from the first frame, so there is no approach and no pre-contact: the episode
+    # opens pulling.  ALONG is HIGH to break the detent and draw the drawer out, and LOW
+    # once it is against its stop, where a stiff axis is only pulling on something that
+    # cannot move.  No constant does both -- which flipping a box and opening a door
+    # cannot show, because neither of them ends.
+    "drawer": {"work": (LOW, HIGH, LOW), "stop": (LOW, LOW, LOW)},
 }
 EXPECTED = dict(TABLES["flip"])
 AXIS_OF = {"t": 0, "n": 1, "r": 2}        # --auto-axes -> (across, along, K_R)
@@ -301,7 +313,39 @@ class DoorScript(Script):
             self.state, self.t0 = "rest", t
 
 
-SCRIPTS = {"flip": FlipScript, "door": DoorScript}
+class DrawerScript(Script):
+    """Pull straight out, and stop when the drawer is out far enough.
+
+    It opens in `work` because the handle is already held -- there is nothing to reach
+    for -- and it pulls along the way the drawer comes out, as last SEEN.  It does not
+    feel for the stop and it does not ease off before it: whatever being still stiff
+    at the stop costs has to land in the force, or the task is not measuring anything.
+    """
+    V_PULL = 0.045                 # m/s
+    # A STRONGER HAND THAN THE DOOR'S.  `Script.K` 300 over `REACH` 0.1 is 30 N, which
+    # the door's comment calls generous against an 11 N latch.  A drawer needs the pull
+    # AND the impedance behind it: measured at 30 N, the detent took 10-11 s of a 30 s
+    # episode to break, and the drawer then came out in 1.5.  Nothing was wrong with
+    # the drawer -- the operator could not pull.
+    # 96 N opened one seed in 4.0 s and shook two others off the handle; 50 N is enough
+    # for the detent the drawer actually has now, and does not snatch.
+    K, REACH = 500.0, 0.10
+
+    def __init__(self, sim, spec):
+        super().__init__(sim, spec)
+        self.state, self.press = "work", True
+
+    def _work(self, t: float, f_fb) -> None:
+        s = self.sim
+        out = self._old("pull", t, s.pull(), self.SEE)
+        self.tgt = self.tgt + self.V_PULL * s.dt * out
+        # pull ON to the stop: stopping at `target` means the drawer never reaches its
+        # end, and the end is the whole point of the task
+        if s.seated():
+            self.state, self.t0 = "rest", t
+
+
+SCRIPTS = {"flip": FlipScript, "door": DoorScript, "drawer": DrawerScript}
 
 
 class ContactHand:
@@ -324,7 +368,10 @@ class ContactHand:
 
     def __init__(self, sim, hand):
         self.sim, self.hand = sim, hand
-        self.phase, self.done = "reach", False
+        # A GRASPED task opens already working: there is nothing to reach for and
+        # nothing to decide about when it was met.
+        self.grasped = bool(getattr(sim, "GRASPED", False))
+        self.phase, self.done = ("work" if self.grasped else "reach"), False
         self._idle = 0.0
         self._met = False
 
@@ -342,6 +389,11 @@ class ContactHand:
         press = bool(self.hand.press)
         self._idle = 0.0 if press else self._idle + self.sim.dt
         let_go = self._idle > self.RELEASE
+        if self.grasped:
+            # held, so `let_go` means nothing; the only move is onto the stop
+            if self.phase == "work" and self.sim.seated():
+                self.phase = "seated"
+            return f_h
         if self.phase == "reach":
             self._met = False
             if press:
@@ -675,6 +727,12 @@ def main() -> None:
                     help="hold an axis at one level (0 low, 1 mid, 2 high) whatever the "
                          "table says, e.g. `--pin r=0`.  The unpinned axes keep "
                          "following the schedule: the PER-AXIS ablation --hold cannot do")
+    ap.add_argument("--shift-axes", nargs="+", default=None, choices=("t", "n", "r"),
+                    help="with --shift: only these axes are moved; the rest switch on "
+                         "time.  Default: all three.  Moving one axis is how you ask "
+                         "WHICH axis's timing matters -- `--pin` answers only whether "
+                         "its LEVEL does, and a pinned axis has no transitions at all, "
+                         "so the two questions are not separable without this")
     ap.add_argument("--shift", type=float, default=None, metavar="S",
                     help="the table's own switches, S seconds late (negative: early), "
                          "replayed from a reference pass of the same episode: the "
@@ -700,6 +758,7 @@ def main() -> None:
 
     EXPECTED.clear()
     EXPECTED.update(TABLES[args.task])
+    GROUPS[:] = [g for g in ("approach", "pre-contact", "work", "stop") if g in EXPECTED]
     levels = WPR.Levels(xy=tuple(args.k_across), z=tuple(args.k_along), kr=tuple(args.k_r))
     out = pathlib.Path(args.out or f"demos/{args.task}")
     out.mkdir(parents=True, exist_ok=True)

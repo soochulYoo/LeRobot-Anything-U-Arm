@@ -84,6 +84,11 @@ UP = np.array([0.0, 0.0, 1.0])
 VR_AXES = np.column_stack([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]])
 
 
+def rot_y(a: float) -> Array:
+    c, s_ = float(np.cos(a)), float(np.sin(a))
+    return np.array([[c, 0.0, s_], [0.0, 1.0, 0.0], [-s_, 0.0, c]])
+
+
 def rot_z(a: float) -> Array:
     c, s = np.cos(a), np.sin(a)
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
@@ -127,6 +132,10 @@ class ContactSim:
     START_KR = 3.0
     R_START = R_DOWN       # how the stick is held, for the whole episode
     LANDS = True           # is there a landing to judge?  see ContactCriteria
+    CRITERIA = staticmethod(lambda: None)      # a task may name its own
+    # Does the episode open with the work already held?  A grasped task has no approach
+    # and no landing, so the protocol's first two rows do not apply to it.
+    GRASPED = False
     # WHEN THE WORK BEGINS, once the tip has met it -- which is when the protocol's WORK
     # row may come in.  "turn": when the tip is travelling across the way it came (the
     # box: it leans, then carries).  "dwell": when the landing is over (the door: it
@@ -147,7 +156,7 @@ class ContactSim:
                  gains: C.Case1Gains | None = None,
                  criteria: ContactCriteria | None = None, render_mode: str | None = None):
         self.cameras = cameras
-        self.crit = criteria or ContactCriteria()
+        self.crit = criteria or self.CRITERIA() or ContactCriteria()
         # ONE env for the session and never reconfigured: reconfiguring rebuilds the
         # robot under the controller holding it, and closes the operator's window.
         self.env = gym.make(self.ENV_ID, num_envs=1, sim_backend="cpu",
@@ -159,8 +168,14 @@ class ContactSim:
         self.dt = 1.0 / self.u.sim_freq
         self.robot = self.u.agent.robot
         self.nq = len(self.robot.active_joints)
-        self.ctl = C.Case1Controller(self.robot, gains or C.Case1Gains(),
-                                     self.u.agent.urdf_path)
+        g = gains or C.Case1Gains()
+        # The drawer's robot is the plain Panda -- 9 joints, not the sticks' 7 -- and
+        # the impedance drives only the arm; the fingers are held by their own PD.  A
+        # 7-long tau_limit against a 9-long torque is a broadcast error at the first
+        # step.  `peg_sim` pads the same way, and for the sticks nq == 7 so this is a
+        # no-op there.
+        g.tau_limit = np.concatenate([C.PANDA_TAU_LIMIT, np.zeros(self.nq - 7)])
+        self.ctl = C.Case1Controller(self.robot, g, self.u.agent.urdf_path)
         self.qlim = self.robot.get_qlimits()[0].cpu().numpy()
         self._q_like = None        # the arm's configuration last time: the next start's seed
         links = self.robot.get_links()
@@ -689,4 +704,313 @@ class DoorSim(ContactSim):
         return self._finish(res, checks)
 
 
-SIMS = {"flip": (FlipSim, FlipSpec), "door": (DoorSim, DoorSpec)}
+# --------------------------------------------------------------------------- #
+#                        DRAWER:  robot --- chest of drawers
+# --------------------------------------------------------------------------- #
+@dataclasses.dataclass
+class DrawerSpec:
+    seed: int = 0
+    chest_xy: tuple = (0.56, 0.0)     # m: where the closed fronts are
+    yaw: float = 0.0                  # rad: which way the chest is turned
+    tier: int = 0                     # which drawer is the task.  0 = top
+    detent: float = 6.0               # N to break before it moves at all
+    drag: float = 12.0                # N s/m in the slide
+    grab: float = 0.0                 # m ALONG THE PILLAR: how far out it is gripped
+    belief_err: float = 0.0           # m along the approach: told minus true
+    standoff: float = 0.050           # m short of the TOLD bar, where the tip starts
+    target: float = 0.085             # m out: open enough
+    time_limit: float = 30.0
+
+    @staticmethod
+    def sample(seed: int) -> "DrawerSpec":
+        rng = np.random.default_rng(seed)
+        return DrawerSpec(seed=seed,
+                          chest_xy=(float(rng.uniform(0.54, 0.58)),
+                                    float(rng.uniform(-0.03, 0.03))),
+                          yaw=float(np.deg2rad(rng.uniform(-6.0, 6.0))),
+                          # THE DETENT, small.  It is here so `along` has a reason to
+                          # be stiff at the START as well as soft at the stop, but it
+                          # is NOT what this task is for -- the stop is.  At 3-10 N it
+                          # was the whole episode: a flush pillar is held by friction
+                          # along the pull, and measured, breaking a 9.5 N detent took
+                          # 10-11 s of a 30 s episode while the drawer itself then came
+                          # out in 1.5.  Sized so a friction grip can break it.
+                          detent=float(rng.uniform(1.0, 3.5)),
+                          drag=float(rng.uniform(6.0, 18.0)),
+                          # ALONG the pillar (x), not across it.  Across was the bar
+                          # version's variable and it is wrong here: the pillar's
+                          # grasped dimension IS y, so an offset there puts one finger
+                          # on first and shoves the drawer sideways -- measured, 62 N
+                          # against 77 N and a 14 N net side load on the rail.
+                          # +-5 mm, not +-10.  At 10 the grasp lands within 16 mm of
+                          # the pillar's tip, and on a yawed chest that is where a
+                          # two-finger grip has least margin: seed 96001 (yaw +5.0 deg,
+                          # grab -9.8 mm) failed in every configuration tried, at 160 N
+                          # across, while its neighbours opened in 4.8 s.
+                          grab=float(rng.uniform(-0.005, 0.005)),
+                          belief_err=float(rng.uniform(-0.012, 0.012)))
+
+
+class DrawerSim(ContactSim):
+    """The top drawer of a chest, pulled open with the ball of a stick.
+
+    THE PEG'S ROBOT, AND ALREADY GRASPED.  The plain Panda with two fingers, not the
+    ball-tipped stick the other two contact tasks use -- a ball can push a door and
+    cannot pull a drawer.  The episode opens with the fingers closed on the handle,
+    exactly as the peg opens with the peg already gripped.
+
+    THE FINGERS CLOSE ON THE PILLAR'S TWO SIDE FACES, coming down from above, and the
+    drawer comes out on friction -- 0.7 against 120 N a finger is about 170 N of hold
+    against a pull that peaks near 50.  (A fixed constraint would hold it too and read
+    ZERO force: measured, the wrench went silent, the detent never broke and the drawer
+    never moved.  Friction through a real contact is reported; a drive is not.)
+
+    WHAT THE HAND HAS TO DO: pull, hard enough to break a detent nobody told it; and
+    stop pulling when the drawer reaches its stop, which nobody announces either.
+
+    A HELD HANDLE MAKES BOTH AXES SHARPER, not softer.  A ball resting on an open bar
+    relieves a too-stiff ACROSS by sliding off; gripped, it has nowhere to go, so every
+    millimetre the hand is wrong across the rail is carried into the slide and into the
+    fingers.  ACROSS is soft because the rail is a rigid constraint, not because the
+    grip is weak.
+
+    WHY THIS TASK EXISTS.  The drawer ends.  `along` has to be stiff to break the detent
+    and draw the drawer out, and must not still be stiff when the front reaches its
+    travel, because then the arm is pulling a stop that cannot move.  Neither constant
+    works, so the axis has to be SCHEDULED -- which is the one thing flipping a box and
+    opening a door cannot show, because nothing in either of them has an end.
+    """
+    ENV_ID = "TeleopDrawer-v1"
+    TASK = "drawer"
+    WORK_ON = "dwell"
+    GRASPED = True
+    LANDS = False          # nothing lands: the handle is held from the first frame
+    TOOL_LINK = "panda_hand"
+    # HELD DIAGONALLY, and pulled horizontally.  Straight down (R_DOWN) is how the
+    # stick tasks hold, and on a drawer it puts the wrist directly over the handle and
+    # then asks the whole arm to translate backwards: the recorded demo swings the
+    # elbow right across the chest, which is where the stray link-on-work contact
+    # comes from.  Pitched 40 deg the hand comes at the pillar from above and in front,
+    # the way a hand reaches a drawer, and the pull is still straight along -x.
+    #
+    # Pitch is about the hand's own y, and the FINGERS close along y -- so tilting does
+    # not disturb the grasp at all: they still meet the pillar's two side faces.
+    # 0 is straight down, 90 is HORIZONTAL -- the hand level with the pillar, pulling
+    # along its own axis, which is how a hand opens a drawer.  Measured over 40 / 70 /
+    # 90 on the same three seeds: 90 is 3/3 at 3.9-4.8 s, 40 is 3/3 at 4.6-5.2, and 70
+    # is 2/3.  Horizontal is both the natural pose and the quickest, and the wrist
+    # carries less for it (0.17-0.21 Nm against 0.19-0.23).  Not monotone in the pitch,
+    # and three seeds is thin -- the 70 failure may be noise.
+    GRASP_PITCH = np.radians(float(__import__("os").environ.get("DRAWER_PITCH", 90.0)))
+    R_START = rot_y(-GRASP_PITCH) @ R_DOWN
+    FINGERS = ("panda_leftfinger", "panda_rightfinger")
+    GRIP_SETTLE = 300      # steps to let the fingers close before the episode starts
+    # THE SQUEEZE.  A PD drive makes K * deflection, not its force LIMIT: at 2e3 and a
+    # 9 mm half-pillar that is 18 N a finger, so ~25 N of friction against a pull that
+    # needs 40-50 to break the detent and draw the drawer.  Measured, the pillar slipped
+    # straight out -- the fingers sat at 0.0089 (on the pillar) and then closed to 0.000
+    # (empty) while the arm dragged itself 0.47 m with nothing in it.  Stiff enough to
+    # saturate instead, at a force limit a real Panda has (~70 N a finger).
+    # 45 N a finger, not 70: at mu 1.2 that is 108 N of hold against a 40-50 N pull,
+    # and every newton of squeeze that does not cancel between the fingers lands on the
+    # rail as a side load.  Half the squeeze, half the residual.
+    GRIP_K, GRIP_D, GRIP_F = 2e4, 5e2, 45.0
+    # THE DRAWER'S OWN LIMITS.  Flip and door are written against 20 N across and 45 N
+    # of overload, and nothing in either of them ever reaches an end.  Measured here,
+    # the protocol run correctly peaks at 41-50 N in the 0.32 s between the drawer
+    # seating and the operator softening, and falls to 1-2 N once `stop` comes in.  So
+    # the stick tasks' numbers would fail every episode including the good ones.  These
+    # pass a correctly timed pull and still catch one that stays stiff on the stop.
+    # WHAT ACROSS MEANS ON A GRASPED TASK.  Measured on correct pulls, across runs a
+    # p50 of 8-11 N and peaks 83-112, and every peak sits on one of the two events this
+    # task is made of: the arm straining just before the detent lets go, and the drawer
+    # reaching its stop.  It is also inflated by the DIAGONAL hold -- a hand pitched 40
+    # deg pulling back loads the pillar vertically, and vertical is across by
+    # definition.  So across here is not "the arm fighting the rail" as cleanly as it
+    # is on flip and the door, and it is read with that in mind.  Their 20/45 would
+    # fail every episode including the good ones.
+    CRITERIA = staticmethod(lambda: ContactCriteria(across_force=130.0, overload=140.0))
+    SEATED = 0.004         # m of travel left: the drawer is against its stop
+    SEATED_S = 0.10        # s it has to be there for
+    BREAK_S = 0.05         # s the pull has to exceed the detent for
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # ContactSim makes TOOL_LINK grippy, and here TOOL_LINK is the hand -- a link
+        # that never touches anything.  What holds the pillar is the FINGERS, and the
+        # Panda's own finger material is not nearly grippy enough to pull a drawer
+        # ALONG the grip axis: the pillar crept out and a pull that takes 3 s took 17.
+        # The peg does exactly this to its ball, and for the same reason.
+        grip = sapien.physx.PhysxMaterial(1.5, 1.5, 0.0)
+        for nm in self.FINGERS:
+            lk = sapien_utils.get_obj_by_name(self.robot.get_links(), nm)
+            for sh in lk._objs[0].get_collision_shapes():
+                sh.set_physical_material(grip)
+
+    def _work(self):
+        return self.u.fronts[self.spec.tier]
+
+    def out(self) -> float:
+        """How far the task's drawer has come out, in metres."""
+        return float(self.u.chest.get_qpos()[0, self.spec.tier])
+
+    def pull(self) -> Array:
+        """Out of the chest, towards the arm: the direction of the pull."""
+        return -rot_z(self.spec.yaw)[:, 0]
+
+    def reset(self, spec: DrawerSpec) -> dict:
+        self.spec = spec
+        self.env.reset(seed=spec.seed)
+        u = self.u
+        Rd = rot_z(spec.yaw)
+        base = np.array([spec.chest_xy[0] + u.BODY[0] + u.FRONT_T, spec.chest_xy[1],
+                         SC.TABLE_TOP + u.BODY[2]])
+        u.chest.set_pose(sapien.Pose(p=base, q=mat2quat(Rd)))
+        n = u.N_TIERS
+        u.chest.set_qpos(torch.zeros((1, n)))
+        u.chest.set_qvel(torch.zeros((1, n)))
+        # THE DETENT AND THE DRAG, as a drive rather than the joint's `friction`: in this
+        # engine that is a coefficient on the load through the slide, not a force, and a
+        # drawer pulled by a ball puts almost no load through it -- exactly the reason
+        # the door's closer is a drive too.  Target 0 with a stiffness of 0 is a pure
+        # damper; the detent is held as a limit until the pull has broken it.
+        for j in u.slides:
+            j.set_friction(0.0)
+            j.set_drive_properties(0.0, float(spec.drag), 1e6, "force")
+            j.set_drive_target(0.0)
+        self._limit(spec.tier, 0.0)
+        # the other drawers stay shut: they are scenery, and a task you can fail by
+        # opening the wrong one is a different task
+        for i in range(n):
+            if i != spec.tier:
+                self._limit(i, 0.0)
+        # where the fingers close on the pillar, `grab` along its length
+        z = u._tier_z(spec.tier)
+        # the bar's axis, where the fingers close: the scene's own expression
+        px_ = spec.chest_xy[0] + u.bar_dx()
+        self.bar = np.array([px_, spec.chest_xy[1], z]) + Rd @ np.array(
+            [spec.grab, 0.0, 0.0])
+        self.tip_on = self.bar.copy()
+        # held, so there is no standoff and no belief error about WHEN it is met: what
+        # is still hidden is the detent, the drag, and where the stop is
+        self.told = self.tip_on
+        self._begin(self.tip_on, -self.pull())
+        self._grasp()
+        self.broken = False          # the detent has let go
+        self._pull_s = 0.0
+        self.max_out = 0.0
+        self.open_t = None
+        self.seated_s = 0.0
+        return self.observe()
+
+    def _limit(self, i: int, hi: float) -> None:
+        # on the JOINT, as the door's hinge does it: the Articulation wrapper has no
+        # setter for its limits
+        self.u.slides[i].set_limits(np.array([[0.0, float(hi)]], dtype=np.float32))
+
+    def _grasp(self) -> None:
+        """Close the fingers on the bar, as `peg_sim.PegSim._grasp` closes them on the
+        peg: drive them shut, step until they have settled, and only then hand the arm
+        back to torque control -- stepping the scene directly bypasses the controller,
+        so every other joint has to be told to hold where it is meanwhile."""
+        robot = self.robot
+        q = robot.get_qpos()[0].cpu().numpy().copy()
+        q[-2:] = self.u.PILLAR[1] + 0.004            # just open round the pillar
+        robot.set_qpos(q[None, :])
+        robot.set_qvel(np.zeros((1, self.nq)))
+        # `_begin` has just run `disable_joint_drives`, which zeroes EVERY joint's PD --
+        # fingers included, so without this they simply fall open.  The arm must stay at
+        # zero (the impedance is the only thing driving it) and the fingers must not.
+        for i, j in enumerate(robot.active_joints):
+            if "finger" in j.name:
+                j.set_drive_properties(self.GRIP_K, self.GRIP_D, force_limit=self.GRIP_F)
+                j.set_drive_target(0.0)              # squeeze
+            else:
+                j.set_drive_properties(0.0, 0.0, force_limit=1000.0)
+                j.set_drive_target(float(q[i]))
+        # Stepping the scene directly bypasses the controller, so the arm would sag over
+        # these steps; hold it by setting qpos back each time rather than by a PD, which
+        # would be the stiff servo in series that `disable_joint_drives` exists to avoid.
+        for _ in range(self.GRIP_SETTLE):
+            self.u.scene.step()
+            qn = robot.get_qpos()[0].cpu().numpy().copy()
+            qn[:-2] = q[:-2]
+            robot.set_qpos(qn[None, :])
+            robot.set_qvel(np.zeros((1, self.nq)))
+
+    def _force(self, rec) -> Array:
+        """What the hand puts into the drawer: BOTH fingers summed.
+
+        One finger alone is mostly the squeeze.  Summed, the squeeze cancels and what
+        is left is the net the hand is pulling with -- which is the quantity the detent
+        has to be broken by and the quantity the force criteria are about.
+        """
+        front = self.u.fronts[self.spec.tier]
+        tot = np.zeros(3)
+        for nm in self.FINGERS:
+            lk = sapien_utils.get_obj_by_name(self.robot.get_links(), nm)
+            tot += self.u.scene.get_pairwise_contact_forces(lk, front)[0].cpu().numpy()
+        return tot
+
+    def _task_step(self, rec, touching: bool) -> None:
+        # the drawer pulling back on the fingers is the fingers pulling the drawer
+        pull = float(self.f_filt @ self.pull())
+        if not self.broken:
+            self._pull_s = self._pull_s + self.dt if pull >= self.spec.detent else 0.0
+            if self._pull_s >= self.BREAK_S:
+                self.broken = True
+                self._limit(self.spec.tier, self.u.TRAVEL)
+        self.engaged = self.broken
+        x = self.out()
+        self.max_out = max(self.max_out, x)
+        if x >= self.spec.target and self.open_t is None:
+            self.open_t = self.t
+        # AGAINST THE STOP: the one state this task has that the door does not
+        self.seated_s = (self.seated_s + self.dt
+                         if self.u.TRAVEL - x <= self.SEATED else 0.0)
+        # `lost` cannot happen while the handle is held; it is kept so the record has
+        # the same fields whether or not a later version lets go
+
+    def seated(self) -> bool:
+        return self.seated_s >= self.SEATED_S
+
+    def _over(self) -> bool:
+        """SEATED, not merely open.
+
+        Ending at `target` ended the episode at 85 mm while the stop is at 110, so the
+        drawer never reached its end and the `stop` row never came in -- measured, the
+        levels changed exactly once per episode, into `work`, and the one thing this
+        task exists to make happen did not.  The episode now runs until the drawer has
+        been against its stop for `SEATED_S`; `opened` is still the success test.
+        """
+        return self.seated()
+
+    def _task_fields(self) -> dict:
+        x = self.out() if hasattr(self, "spec") else 0.0
+        tgt = self.spec.target if hasattr(self, "spec") else 1.0
+        return dict(progress=float(np.clip(x / tgt, 0.0, 1.0)), out=x,
+                    broken=bool(getattr(self, "broken", False)),
+                    seated=bool(getattr(self, "seated_s", 0.0) >= self.SEATED_S))
+
+    def privileged(self) -> dict:
+        s = self.spec
+        return {"chest_xy": np.asarray(s.chest_xy), "yaw": s.yaw, "tier": s.tier,
+                "detent": s.detent, "drag": s.drag, "grab": s.grab,
+                "belief_err": s.belief_err, "bar": self.bar}
+
+    def score(self) -> dict:
+        res, checks = self._common_score()
+        x = self.out()
+        res.update(opened=bool(x >= self.spec.target), out_m=float(x),
+                   max_out_m=float(self.max_out),
+                   progress=float(np.clip(self.max_out / self.spec.target, 0.0, 1.0)),
+                   broken=bool(self.broken), lost=False,
+                   seated=bool(self.seated()), open_s=self.open_t)
+        # nothing shuts a drawer behind you, so unlike the door this is max_out and not
+        # where it happens to be when time runs out
+        checks = {"opened": bool(self.max_out >= self.spec.target - 0.004), **checks}
+        return self._finish(res, checks)
+
+
+SIMS = {"flip": (FlipSim, FlipSpec), "door": (DoorSim, DoorSpec),
+        "drawer": (DrawerSim, DrawerSpec)}

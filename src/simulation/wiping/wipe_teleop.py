@@ -110,3 +110,31 @@ class SyntheticWiper(T.SyntheticWriter):
                 "finished": st.kr_travel}[self.phase]
         self.kr_cmd += (want - self.kr_cmd) * min(1.0, self.dt / st.kr_tau)
         return self.kr_cmd
+
+
+class GlyphWiper(SyntheticWiper):
+    """A wiper that ERASES ALONG THE GLYPH, the way a hand does.
+
+    `SyntheticWiper` rasters: boustrophedon rows over the marks' bounding box.  That
+    is the easy way to cover ink and it is not how anyone wipes a letter off a board
+    -- a hand traces the S.  Two things follow, and both are the reason this class
+    exists:
+
+      THE PATH IS LONGER and it is mostly NOT axis-aligned, so the pad is dragged in
+      a direction that keeps turning.
+
+      THE WRIST HAS SOMETHING TO DO.  A raster row is straight, so the pad's heading
+      is constant down it and K_R is asked for almost nothing; on a curve the contact
+      patch turns under the pad the whole way.  A flat board rastered is a task with
+      no rotational demand in it at all, and "K_R does not matter" measured on that
+      is a statement about the path, not about the wrist.
+
+    It is the parent's own behaviour, unsuppressed: `SyntheticWriter` already follows
+    `sim.target.strokes`, and SyntheticWiper replaces them with rows.  This puts them
+    back.
+    """
+
+    def __init__(self, sim, style: "WiperStyle", margin: float = 1.0):
+        super().__init__(sim, style, margin)
+        self.rows = [np.asarray(s, float) for s in sim.target.strokes]
+        self.strokes = [T._curvature(s) for s in sim.target.strokes]

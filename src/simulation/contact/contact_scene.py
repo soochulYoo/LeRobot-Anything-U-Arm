@@ -312,6 +312,147 @@ class FlipEnv(ContactEnv):
 
 
 # --------------------------------------------------------------------------- #
+@register_env("TeleopDrawer-v1", max_episode_steps=1_000_000)
+class DrawerEnv(ContactEnv):
+    """robot --- drawers.  A three-tier chest on the desk; the TOP drawer is pulled out.
+
+    THE GRIPPER, NOT THE STICK.  Flipping and the door are done with a ball on a stick,
+    which can push and cannot pull.  This task uses the peg's robot -- the plain Panda,
+    with its two fingers -- and opens with the handle already GRASPED, as the peg opens
+    already gripped.
+
+    SO THE HANDLE IS A RECTANGULAR PILLAR standing straight out of the front, the way a
+    real drawer pull does.  The fingers come down from above and close on its two side
+    faces, and the drawer comes out on friction -- which is ample: 0.7 against 120 N a
+    finger is about 170 N of hold against a pull that peaks near 50.
+
+    (A fixed constraint would hold the handle too, and would read ZERO force -- a drive
+    is not a contact.  Measured on the first cut: the wrench went silent, the detent
+    never broke and the drawer never moved.)
+
+    THREE TIERS, and the top one is the task, because the other two are what makes
+    finding it a thing you have to do by eye: they are the same bar at the same stand-off
+    and differ only in height.
+
+    THE STOP IS THE POINT.  The drawer runs on a prismatic joint with a hard limit at
+    `TRAVEL`, and a `detent` of static friction to break before it moves at all.  So the
+    along axis has to be stiff to get it started and must not still be stiff when it
+    reaches the end -- there is no constant that does both, which is what this task is
+    here to show.
+    """
+    SUPPORTED_ROBOTS = ["panda"]
+    ROBOT = "panda"                          # the peg's robot: fingers, not a stick
+    LOOK_AT = np.array([0.50, 0.0, 0.17])
+    # A TABLETOP chest.  The first cut was 150 x 180 x 240 half extents -- a 300 x 360 x
+    # 480 mm chest that filled half the desk and put the top drawer 400 mm up, out of
+    # the cameras and awkward for the arm.  Three 60 mm tiers on a 200 x 240 footprint
+    # sit where the other two tasks' work sits.
+    BODY = np.array([0.100, 0.120, 0.090])   # m half extents: deep, wide, tall
+    FRONT_AT = 0.56                          # m: x of the closed drawer fronts
+    N_TIERS = 3
+    TRAVEL = 0.110                           # m: the hard stop, fully out
+    DRAWER_MASS = 0.6                        # kg
+    FRONT_T = 0.014                          # m: the drawer front's thickness
+    # THE PILLAR.  Half extents: how far it stands out of the front, half its width
+    # (what the fingers close on, against the Panda's 80 mm of opening), and half its
+    # height.  Nothing stands behind it and nothing needs to: the grip is friction.
+    PILLAR = np.array([0.026, 0.009, 0.013])
+
+    def bar_dx(self) -> float:
+        """x of the pillar's MID-LENGTH, relative to the closed front's outer face --
+        where the fingers close.
+
+        The task grasps with this and `_load_task` builds with it, so the two cannot
+        drift apart.  They did once, by one FRONT_T, and the tool started the episode
+        inside the handle: 10.8 kN on the first step.
+        """
+        return -self.PILLAR[0]
+
+    def _tier_z(self, i: int) -> float:
+        """Centre height of tier i, 0 = top."""
+        h = 2 * self.BODY[2] / self.N_TIERS
+        return TABLE_TOP + 2 * self.BODY[2] - (i + 0.5) * h
+
+    def _load_task(self) -> None:
+        d, w, _ = self.BODY
+        self.front_material = sapien.physx.PhysxMaterial(0.7, 0.7, 0.0)
+        # The pillar is GRIPPY -- a drawer pull is wood or rubber in a hand, not steel
+        # on steel, and the grasp here is friction along the pull.  The peg's ball uses
+        # 1.5 for the same reason.
+        self.grip_material = sapien.physx.PhysxMaterial(1.2, 1.2, 0.0)
+        builder = self.scene.create_articulation_builder()
+
+        # THE CARCASS, seen and felt: the drawers come out of it and the arm can hit it
+        case = builder.create_link_builder(parent=None)
+        case.set_name("case")
+        case.add_box_visual(half_size=self.BODY.tolist(),
+                            material=sapien.render.RenderMaterial(
+                                base_color=[0.38, 0.33, 0.29, 1]))
+        case.add_box_collision(half_size=self.BODY.tolist(), material=self.still_material)
+
+        hh = self.BODY[2] / self.N_TIERS          # half the height of one tier
+        self.drawers, self.fronts = [], []
+        for i in range(self.N_TIERS):
+            dz = self._tier_z(i) - (TABLE_TOP + self.BODY[2])    # relative to the carcass
+            lk = builder.create_link_builder(case)
+            lk.set_name(f"drawer{i}")
+            # the FRONT, the only part the ball ever meets
+            fx = d + self.FRONT_T / 2
+            colour = [0.80, 0.56, 0.32, 1] if i else [0.86, 0.64, 0.38, 1]
+            lk.add_box_visual(pose=sapien.Pose([-fx, 0, dz]),
+                              half_size=[self.FRONT_T / 2, w * 0.96, hh * 0.92],
+                              material=sapien.render.RenderMaterial(base_color=colour))
+            lk.add_box_collision(pose=sapien.Pose([-fx, 0, dz]),
+                                 half_size=[self.FRONT_T / 2, w * 0.96, hh * 0.92],
+                                 material=self.front_material,
+                                 density=self.DRAWER_MASS / (2 * self.FRONT_T * w * hh))
+            # THE BOX behind the front, so a drawer that is open looks like a drawer
+            # and not a floating panel.  VISUAL ONLY: the carcass is one solid collider
+            # and a drawer body with collision would be inside it, so the two would
+            # fight on the first step.  Nothing has to touch the inside of a drawer --
+            # the fingers only ever meet the pillar.
+            inner_t = 0.004
+            back_x, front_x = d - 0.006, -fx + self.FRONT_T / 2
+            cx, cdx = 0.5 * (back_x + front_x), 0.5 * (back_x - front_x)
+            iw, ih = w * 0.93, hh * 0.78
+            box = sapien.render.RenderMaterial(base_color=[0.62, 0.45, 0.28, 1],
+                                               roughness=0.85)
+            for pos, half in (
+                ([cx, 0.0, dz - ih + inner_t], [cdx, iw, inner_t]),          # bottom
+                ([cx, iw - inner_t, dz], [cdx, inner_t, ih]),                # left
+                ([cx, -(iw - inner_t), dz], [cdx, inner_t, ih]),             # right
+                ([back_x - inner_t, 0.0, dz], [inner_t, iw, ih]),            # back
+            ):
+                lk.add_box_visual(pose=sapien.Pose(pos), half_size=half, material=box)
+
+            # THE PILLAR: one box out of the middle of the front.
+            wood = sapien.render.RenderMaterial(base_color=[0.78, 0.62, 0.40, 1],
+                                                roughness=0.7)
+            bx = self.bar_dx() - (d + self.FRONT_T)
+            lk.add_box_visual(pose=sapien.Pose([bx, 0.0, dz]),
+                              half_size=self.PILLAR.tolist(), material=wood)
+            lk.add_box_collision(pose=sapien.Pose([bx, 0.0, dz]),
+                                 half_size=self.PILLAR.tolist(),
+                                 material=self.grip_material, density=500.0)
+            # a prismatic joint slides along its own x, which here is world -x: out,
+            # towards the arm.  The limit IS the stop this task is about.
+            lk.set_joint_name(f"slide{i}")
+            q = [0.0, 0.0, 0.0, 1.0]        # x -> -x
+            lk.set_joint_properties(type="prismatic", limits=[[0.0, self.TRAVEL]],
+                                    pose_in_parent=sapien.Pose([0, 0, 0], q),
+                                    pose_in_child=sapien.Pose([0, 0, 0], q),
+                                    friction=0.0, damping=0.0)
+        builder.initial_pose = sapien.Pose(
+            p=[self.FRONT_AT + d + self.FRONT_T, 0.0, TABLE_TOP + self.BODY[2]])
+        self.chest = builder.build("chest", fix_root_link=True)
+        for i in range(self.N_TIERS):
+            self.fronts.append(sapien_utils.get_obj_by_name(self.chest.get_links(),
+                                                            f"drawer{i}"))
+        self.slides = list(self.chest.get_active_joints())
+        self.slide = self.slides[0]            # the TOP drawer: the one that is the task
+
+
+# --------------------------------------------------------------------------- #
 @register_env("TeleopDoor-v1", max_episode_steps=1_000_000)
 class DoorEnv(ContactEnv):
     """robot --- door.  A door on the desk that is PUSHED open, away from the arm.

@@ -957,9 +957,11 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
             wr = WP.KeyboardWriter(viewer.window, sim,
                                    latch=getattr(args, "keys", "latch") == "latch")
     else:
-        wr = WT.SyntheticWiper(sim, dataclasses.replace(style, hover_dwell=args.dwell,
-                                                        v_desc=args.v_desc,
-                                                        v_travel=args.v_travel))
+        cls = (WT.GlyphWiper if getattr(args, "wipe_path", "raster") == "glyph"
+               else WT.SyntheticWiper)
+        wr = cls(sim, dataclasses.replace(style, hover_dwell=args.dwell,
+                                          v_desc=args.v_desc,
+                                          v_travel=args.v_travel))
     shown = [i for i in range(3) if i not in tuple(hide)]
     names = ("xy", "z", "K_R")
 
@@ -1194,6 +1196,13 @@ def _run_job(job) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--wipe-path", choices=("raster", "glyph"), default="raster",
+                    help="how the scripted wiper covers the ink.  `raster` is "
+                         "boustrophedon rows over the bounding box -- straight, "
+                         "axis-aligned, and the pad's heading never changes, so the "
+                         "wrist is asked for nothing.  `glyph` traces the letter, the "
+                         "way a hand does: longer, curved, and the contact patch turns "
+                         "under the pad the whole way")
     ap.add_argument("--board", choices=("flat", "curved"), default="curved")
     ap.add_argument("--texts", nargs="+", default=["S", "7", "<star>"])
     ap.add_argument("--per-case", type=int, default=50)
