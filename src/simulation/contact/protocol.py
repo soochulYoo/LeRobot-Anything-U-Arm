@@ -288,6 +288,8 @@ class FlipScript(Script):
         s, dt = self.sim, self.sim.dt
         into = self._old("into", t, s.face_inward(), self.SEE)
         up = self._old("up", t, s.face_up(), self.SEE)
+        if getattr(self.sim, "STEER", False):
+            return self._work_steered(t, f_fb, into, up)
         # what comes back through the handle is the spring the tool is stretching:
         # along `into` it is how hard the tip is leaning on the box
         lean = -float(self._old("felt", t, f_fb, self.FEEL) @ into)
@@ -297,6 +299,50 @@ class FlipScript(Script):
         else:
             self.tgt = (self.tgt + self.V_WORK * dt * up
                         + self.HAPTIC * (self.PRESS - lean) * dt * into)
+        if s.rise() >= self.LET_GO:
+            self.state, self.t0, self.press = "rest", t, False
+
+    def _work_steered(self, t: float, f_fb, into, up) -> None:
+        """The same hand, but it KNOWS THE ARC the near end travels.
+
+        The default hand carries its target along the box's `up` as it last saw it --
+        the instantaneous tangent, SEE seconds stale.  Over a 90 degree lift that
+        tangent turns the whole way, so a straight step leaves the arc and the error
+        lands ACROSS the motion.  That is deliberate (see `Script`): it is what makes
+        a wrong stiffness show up in the force instead of being steered away.
+
+        This one carries the target ROUND the arc.  The near end pivots about the
+        box's far bottom edge, one box-length away along `into`, so the step is a
+        rotation of v dt / L about that point rather than a chord off it.
+
+        OFF by default, and here to be COMPARED against rather than to replace: a hand
+        that steers may hide the very thing the protocol is built to measure, and
+        whether it does is itself the question.
+        """
+        s, dt = self.sim, self.sim.dt
+        lean = -float(self._old("felt", t, f_fb, self.FEEL) @ into)
+        if not self.lifting:
+            self.tgt = self.tgt + self.V_TOUCH * dt * into
+            self.lifting = lean >= self.PRESS
+        else:
+            L = float(2 * s.u.BOX_HALF[0])               # the near end's radius
+            pivot = self.tgt + L * into
+            r = self.tgt - pivot
+            dth = self.V_WORK * dt / max(L, 1e-6)
+            # cross(UP, INTO), not the other way round: with into = x and up = z,
+            # cross(into, up) is -y and Rodrigues then carries the target DOWN the
+            # arc.  Measured with the sign wrong: 0/12 success, every episode timing
+            # out at 30 s with the peak force half again the plain hand's.
+            axis = np.cross(up, into)                    # the box turns about this
+            n = float(np.linalg.norm(axis))
+            if n > 1e-9:
+                axis = axis / n
+                r = (r * np.cos(dth) + np.cross(axis, r) * np.sin(dth)
+                     + axis * float(axis @ r) * (1.0 - np.cos(dth)))
+                self.tgt = pivot + r
+            else:
+                self.tgt = self.tgt + self.V_WORK * dt * up
+            self.tgt = self.tgt + self.HAPTIC * (self.PRESS - lean) * dt * into
         if s.rise() >= self.LET_GO:
             self.state, self.t0, self.press = "rest", t, False
 
@@ -727,6 +773,13 @@ def main() -> None:
                     help="hold an axis at one level (0 low, 1 mid, 2 high) whatever the "
                          "table says, e.g. `--pin r=0`.  The unpinned axes keep "
                          "following the schedule: the PER-AXIS ablation --hold cannot do")
+    ap.add_argument("--steer", action="store_true",
+                    help="the scripted hand follows the ARC the work travels instead "
+                         "of the tangent it last saw.  OFF by default on purpose: the "
+                         "default hand's steering error is what makes a wrong "
+                         "stiffness show up in the force rather than be quietly "
+                         "corrected, so turning this on changes what the task "
+                         "measures.  It is here to be compared against")
     ap.add_argument("--shift-axes", nargs="+", default=None, choices=("t", "n", "r"),
                     help="with --shift: only these axes are moved; the rest switch on "
                          "time.  Default: all three.  Moving one axis is how you ask "
@@ -783,6 +836,9 @@ def main() -> None:
     Sim, Spec = CT.SIMS[args.task]
     sim = Sim(cameras=not args.no_cameras, image_size=args.image_size,
               render_mode=None if args.headless else "human")
+    # read by FlipScript._work; an attribute rather than a constructor argument so the
+    # three sims keep one signature and the flag reaches only the hand that uses it
+    sim.STEER = bool(getattr(args, "steer", False))
     viewer = None if args.headless else sim.u.render_human()
 
     auto_ax = () if args.auto_axes == ["none"] else tuple(AXIS_OF[a] for a in args.auto_axes)
