@@ -560,6 +560,11 @@ def run_episode(sim, spec, user, levels, args, recorder=None, viewer=None,
         import interactive as I
         vr = hand = I.VRHand(_HandView(sim))
         vr.map.R = CT.VR_AXES           # behind the arm: away from you is forward
+        if getattr(sim, "GRASPED", False):
+            # Held from the first frame, so there is nothing to press -- and the press
+            # is FORWARD, the stick's push, which on a drawer is into the chest.  A hand
+            # squeezing the trigger to hold the handle pushed against its own pull.
+            vr.map.p.press_force = 0.0
     elif args.motion == "human":
         import interactive as I
         hand = (I.LatchedHand if args.keys == "latch" else I.KeyboardHuman)(

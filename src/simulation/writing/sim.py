@@ -156,7 +156,14 @@ class WritingSim:
         # unusable one: two tasks rasterising 128x128 cameras on llvmpipe ran eight
         # hours at 350% CPU and produced no episodes at all.  Passing "cuda:0" goes
         # through `parse_backend_device_id`, which splits it, so the device id arrives.
-        render_backend = os.environ.get("MS_RENDER_BACKEND", "cuda:0")
+        render_backend = os.environ.get("MS_RENDER_BACKEND")
+        if render_backend is None:
+            # ...but only where ManiSkill parses an index.  The lab PC's installed
+            # 3.0.0b21 looks the name up as given and raised KeyError: 'cuda:0' before
+            # any scene was built; its "gpu" finds the device without one.
+            from mani_skill.envs.utils.system import backend as _msb
+            render_backend = ("cuda:0" if hasattr(_msb, "parse_backend_device_id")
+                              else "gpu")
         self.env = gym.make(self.ENV_ID, num_envs=1, sim_backend="cpu",
                             render_backend=render_backend,
                             obs_mode="rgb" if cameras else "state",

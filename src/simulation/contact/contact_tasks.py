@@ -763,7 +763,9 @@ class DrawerSim(ContactSim):
     drawer comes out on friction -- 0.7 against 120 N a finger is about 170 N of hold
     against a pull that peaks near 50.  (A fixed constraint would hold it too and read
     ZERO force: measured, the wrench went silent, the detent never broke and the drawer
-    never moved.  Friction through a real contact is reported; a drive is not.)
+    never moved.  But the contact report is NORMAL force only -- the friction that
+    carries the pull is not in it either, which is why the detent is now read off the
+    drawer's own travel: see `K_DETENT`.)
 
     WHAT THE HAND HAS TO DO: pull, hard enough to break a detent nobody told it; and
     stop pulling when the drawer reaches its stop, which nobody announces either.
@@ -832,7 +834,19 @@ class DrawerSim(ContactSim):
     CRITERIA = staticmethod(lambda: ContactCriteria(across_force=130.0, overload=140.0))
     SEATED = 0.004         # m of travel left: the drawer is against its stop
     SEATED_S = 0.10        # s it has to be there for
-    BREAK_S = 0.05         # s the pull has to exceed the detent for
+    # THE DETENT IS READ OFF THE DRAWER, not off the fingers.  It used to break when the
+    # fingers' contact force along the pull passed `detent` -- and this engine's contact
+    # report carries each contact's NORMAL force only.  A grip pulls a pillar along its
+    # length through FRICTION, so the pull never showed: measured on a VR pull held at
+    # 12 N, the arm static and the fingers holding, the report read 0.2 N along the pull
+    # and the detent (1-3.5 N) never broke.  The scripted hand only got through by
+    # pulling 25-40 N until the fingers slid along the pillar and caught on something
+    # with a normal -- and then the drawer, released into a spring stretched 50 mm,
+    # shot to its stop.  Now the detent is a drive that GIVES at `detent` newtons:
+    # whatever carries the pull, the drawer moves once it exceeds that, and `broken` is
+    # the drawer having moved.
+    K_DETENT = 2e4         # N/m: holds it shut, 0.2 mm short of a 3.5 N detent
+    BREAK_X = 0.002        # m out: the detent has let go
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -873,11 +887,16 @@ class DrawerSim(ContactSim):
         # engine that is a coefficient on the load through the slide, not a force, and a
         # drawer pulled by a ball puts almost no load through it -- exactly the reason
         # the door's closer is a drive too.  Target 0 with a stiffness of 0 is a pure
-        # damper; the detent is held as a limit until the pull has broken it.
+        # damper.  The task's drawer starts on a stiff spring whose force LIMIT is the
+        # detent, so it gives once the pull passes it (see `K_DETENT`), and is a pure
+        # damper again once it has.
         for j in u.slides:
             j.set_friction(0.0)
             j.set_drive_properties(0.0, float(spec.drag), 1e6, "force")
             j.set_drive_target(0.0)
+        u.slides[spec.tier].set_drive_properties(self.K_DETENT, float(spec.drag),
+                                                 float(spec.detent), "force")
+        # shut by its stop while the fingers close; the detent takes over after `_grasp`
         self._limit(spec.tier, 0.0)
         # the other drawers stay shut: they are scenery, and a task you can fail by
         # opening the wrong one is a different task
@@ -886,18 +905,29 @@ class DrawerSim(ContactSim):
                 self._limit(i, 0.0)
         # where the fingers close on the pillar, `grab` along its length
         z = u._tier_z(spec.tier)
-        # the bar's axis, where the fingers close: the scene's own expression
-        px_ = spec.chest_xy[0] + u.bar_dx()
-        self.bar = np.array([px_, spec.chest_xy[1], z]) + Rd @ np.array(
-            [spec.grab, 0.0, 0.0])
+        # THE PILLAR WHERE THE SCENE PUTS IT: in the carcass's frame, turned with it
+        # about `base`.  This used to be `chest_xy + bar_dx` with only `grab` turned,
+        # which is right for an unturned chest and nowhere else -- the pillar stands
+        # 0.14 m in front of the turning point, so the yaw moved it sideways by
+        # 0.14 sin(yaw): 7 mm at 2.8 deg, 14 at 5.8, against a half-width of 9.  One
+        # finger closed on it, the other on air, and the arm snapped sideways on the
+        # first step (seed 96001, "failed in every configuration tried", was this).
+        self.bar = base + Rd @ np.array(
+            [u.bar_dx() - (u.BODY[0] + u.FRONT_T) + spec.grab, 0.0, z - base[2]])
         self.tip_on = self.bar.copy()
         # held, so there is no standoff and no belief error about WHEN it is met: what
         # is still hidden is the detent, the drag, and where the stop is
         self.told = self.tip_on
+        # THE HAND SQUARE TO THE PILLAR.  R_START alone is square to an unturned chest,
+        # and the chest turns up to 6 deg: the fingers then closed askew, one landed
+        # first, and the episode opened with 75-100 N across the rail and ~4 N along it
+        # -- the `across` peak of every drawer episode, whatever the hand did after.
+        # The grasp is given, as the peg's is, so it is given square.
+        self.R_START = rot_z(spec.yaw) @ type(self).R_START
         self._begin(self.tip_on, -self.pull())
         self._grasp()
+        self._limit(spec.tier, u.TRAVEL)
         self.broken = False          # the detent has let go
-        self._pull_s = 0.0
         self.max_out = 0.0
         self.open_t = None
         self.seated_s = 0.0
@@ -942,8 +972,9 @@ class DrawerSim(ContactSim):
         """What the hand puts into the drawer: BOTH fingers summed.
 
         One finger alone is mostly the squeeze.  Summed, the squeeze cancels and what
-        is left is the net the hand is pulling with -- which is the quantity the detent
-        has to be broken by and the quantity the force criteria are about.
+        is left is the net the hand is pushing with.  NORMAL forces only: this engine
+        does not report friction, so a pull carried by the grip's friction is not in
+        here (see `K_DETENT`).
         """
         front = self.u.fronts[self.spec.tier]
         tot = np.zeros(3)
@@ -953,13 +984,10 @@ class DrawerSim(ContactSim):
         return tot
 
     def _task_step(self, rec, touching: bool) -> None:
-        # the drawer pulling back on the fingers is the fingers pulling the drawer
-        pull = float(self.f_filt @ self.pull())
-        if not self.broken:
-            self._pull_s = self._pull_s + self.dt if pull >= self.spec.detent else 0.0
-            if self._pull_s >= self.BREAK_S:
-                self.broken = True
-                self._limit(self.spec.tier, self.u.TRAVEL)
+        if not self.broken and self.out() >= self.BREAK_X:
+            self.broken = True
+            self.u.slides[self.spec.tier].set_drive_properties(
+                0.0, float(self.spec.drag), 1e6, "force")
         self.engaged = self.broken
         x = self.out()
         self.max_out = max(self.max_out, x)
