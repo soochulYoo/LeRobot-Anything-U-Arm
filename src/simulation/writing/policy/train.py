@@ -194,6 +194,10 @@ def main() -> None:
     #   spring  x_ref + f_d + log K  -- the controller places the target, so a
     #                                   stiffness error stops being a force error
     ap.add_argument("--layout", choices=list(DATA.LAYOUTS), default="legacy")
+    ap.add_argument("--proprio", choices=("auto", "qpos", "pose"), default="auto",
+                    help="what fills the state's qpos slot.  `auto` reads it off the "
+                         "dataset, which is right for every importer that records it; "
+                         "the two are both 7 wide so nothing else can tell them apart")
     # K's only gradient under --layout spring; 0 leaves K unsupervised, which is
     # the honest baseline to compare against.  See model.Config.w_robust.
     ap.add_argument("--w-robust", type=float, default=0.0)
@@ -234,7 +238,11 @@ def main() -> None:
     # a writing one does not.  Read before the model is built, and before
     # --match-params equalises the budgets against them.
     a_dim, s_dim = DATA.dims(args.data, args.layout)
+    proprio = (DATA.proprio_source(args.data) if args.proprio == "auto"
+               else args.proprio)
+    print(f"[dims] action {a_dim}  state {s_dim}  proprio {proprio}")
     cfg = M.Config(case=args.case, arch=args.arch, hidden=args.hidden, A=a_dim, S=s_dim,
+                   proprio=proprio,
                    backbone=args.backbone, vision=not args.no_vision, goal=not args.no_goal,
                    layout=args.layout, w_robust=args.w_robust,
                    robust_delta=args.robust_delta,

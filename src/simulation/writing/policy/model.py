@@ -46,6 +46,13 @@ class Config:
     ft_in: int = DATA.FT
     HIST: int = DATA.HIST
     S: int = DATA.S
+    # WHICH 7-or-9 columns sit in the state's `qpos` slot: "qpos" (the arm's own
+    # joints, what every native recording has) or "pose" (quat + angular velocity,
+    # what a log keeps when its format was written for a robot-agnostic helper).  It
+    # lives in Config because it is part of the model's INPUT CONTRACT: rollout has to
+    # build the same one, and the two are 7 wide either way, so nothing else could
+    # tell them apart.  Absent from an older checkpoint, which means "qpos".
+    proprio: str = "qpos"
     G: int = DATA.G
     D: int = 256
     n_steps: int = 10        # Euler steps at inference

@@ -85,7 +85,16 @@ FT_SUR = 9      # ft_hist channels once surprise is attached: measured | expecte
 INK_FORCE = 0.8 # N, sim.Criteria.ink_force -- the contact gate for the residual
 A = 6           # legacy: x_d delta (3) + log stiffness (3); 7 with log K_R
 A_SPRING = 9    # spring: x_ref delta (3) + f_d (3) + log stiffness (3); 10 with log K_R
-S = 19          # 20 with log K_R
+S_BASE = 12     # x_d - origin (3) + tcp - x_d (3) + tcp_vel (3) + log k_diag (3)
+S_PROPRIO = 7   # the arm's own joints on a FREE Panda; see `proprio_width`
+S = S_BASE + S_PROPRIO      # 19; 20 with log K_R.  The DEFAULT, not the rule:
+# `dims` reads the real width off the data, as it already does for the action.  Two
+# things move it.  A GRIPPED task carries the fingers: the drawer holds its handle, so
+# its qpos is 9 and its state is 21.  And a log from a rig that records no joints at
+# all fills those columns with the proprioception it does have -- `adapters/compact`
+# in the TeleopHelper repo writes quat (4) + angular velocity (3), which is 7 again but
+# is NOT qpos, so `Config.proprio` records which, and rollout must build the same one
+# or the policy meets a different state than it trained on.
 # "spring_rel" is the repair for spring's 32/32 failure.  Spring anchors x_ref on
 # x_d(t) and uses it OPEN LOOP, which protects K's meaning (re-anchoring every
 # substep would make the force exact and K idle) but passes the learned x_ref
@@ -151,8 +160,38 @@ def dims(root, layout: str = "legacy") -> tuple[int, int]:
         raise FileNotFoundError(f"no */ep_*.h5 under {root}")
     with h5py.File(files[0]) as f:
         kr = "kr" in f["action"]
+        s = S_BASE + f["obs"]["qpos"].shape[1]
     a = A_SPRING if layout.startswith("spring") else A
-    return (a + 1, S + 1) if kr else (a, S)
+    return (a + 1, s + 1) if kr else (a, s)
+
+
+def proprio_source(root) -> str:
+    """Which 7-or-9 columns a dataset put in the `qpos` slot: "qpos" or "pose".
+
+    Written by the importer, because the file cannot tell them apart by width alone:
+    a free arm's joints and quat + angular velocity are both 7 wide.  A dataset with
+    no such attribute is a native simulator recording, i.e. real joints.
+    """
+    files = sorted(pathlib.Path(root).glob("*/ep_*.h5"))
+    if not files:
+        raise FileNotFoundError(f"no */ep_*.h5 under {root}")
+    with h5py.File(files[0]) as f:
+        return "pose" if f.attrs.get("proprio", "") == "quat+angvel" else "qpos"
+
+
+def proprio_vec(obs, source: str):
+    """The `qpos` slot of one observation, built the way the checkpoint was trained.
+
+    The ONE place that decision is made, so training and rollout cannot drift apart.
+    `pose` is quat (4) + angular velocity (3): what a log keeps when its format was
+    written for a robot-agnostic helper and has no joint angles in it at all.
+    """
+    if source == "qpos":
+        return np.asarray(obs["qpos"])
+    if source == "pose":
+        return np.concatenate([np.asarray(obs["tcp_quat"]).reshape(-1),
+                               np.asarray(obs["tcp_angvel"]).reshape(-1)])
+    raise ValueError(f"proprio {source!r}: 'qpos' or 'pose'")
 
 
 def episode_samples(path, layout: str = "legacy") -> dict:

@@ -143,8 +143,15 @@ class WipePolicy:
         raw = dict(
             top=DATA._down(np.asarray(obs["rgb_top_camera"])[None]),
             wrist=DATA._down(np.asarray(obs["rgb_wrist_camera"])[None]),
+            # THE qpos SLOT IS BUILT THE WAY THE CHECKPOINT WAS TRAINED, and not
+            # from whatever this simulator happens to expose: a free arm's joints and
+            # quat + angular velocity are both 7 wide, so a mismatch here would be
+            # silent -- the policy would simply meet a different state than it was
+            # fitted on.  `Config.proprio` carries the answer; older checkpoints have
+            # no such field and default to "qpos", which is what they were.
             state=DATA.state_vec(x_d, obs["tcp_pos"], obs["tcp_vel"], obs["k_diag"],
-                                 obs["qpos"], self.origin, kr)[None].astype(np.float32),
+                                 DATA.proprio_vec(obs, getattr(self.cfg, "proprio", "qpos")),
+                                 self.origin, kr)[None].astype(np.float32),
             goal=(self.gp - x_d[:2]).reshape(1, -1).astype(np.float32),
             ft_hist=np.stack(self.hist)[None])
         b = {k: jnp.asarray(v) for k, v in DATA.features(**raw, stats=self.stats).items()}
