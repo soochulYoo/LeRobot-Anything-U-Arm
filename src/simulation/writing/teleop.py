@@ -153,7 +153,9 @@ class TeleopSession:
         prop = C.Case1Proposal(Vd=(x_d_req - sim.ctl.x_d) / dt,
                                Up=(K_req - sim.ctl.K) / dt,
                                Ur=(None if self.kr_cmd is None
-                                   else (self.kr_cmd - sim.ctl.kr) / dt))
+                                   else (self.kr_cmd - sim.ctl.kr) / dt),
+                               # the task's ceiling on the lean, if it has set one
+                               f_push=getattr(sim, "F_PUSH", None))
         rec = sim.step(prop)
 
         # ---- reflected force: the spring the slave is stretching ----

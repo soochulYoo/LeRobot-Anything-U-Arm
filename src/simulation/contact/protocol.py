@@ -900,6 +900,18 @@ def main() -> None:
                     help="the table's own switches, S seconds late (negative: early), "
                          "replayed from a reference pass of the same episode: the "
                          "TIMING check")
+    ap.add_argument("--f-push", type=float, default=None, metavar="N",
+                    help="THE LEAN CLAMP: a ceiling on the spring force the operator "
+                         "may ask for.  The reference is refused the one component of "
+                         "its velocity that would stretch the spring further; a slide "
+                         "along the surface and a RETREAT are both untouched, and it "
+                         "releases itself once the work gives way.  For a force spent "
+                         "LEANING (flip: f = K e, corr +0.771) and not on arrival")
+    ap.add_argument("--press", type=float, default=None, metavar="N",
+                    help="override the scripted hand's press target (FlipScript.PRESS, "
+                         "5 N).  Raising it makes the script lean like a person does -- "
+                         "the VR median is 22.8 N across against the script's 7.9 -- "
+                         "which is how the clamp gets something to catch")
     ap.add_argument("--time-limit", type=float, default=None,
                     help="override the spec's 30 s")
     ap.add_argument("--headless", action="store_true")
@@ -954,6 +966,12 @@ def main() -> None:
     if getattr(args, "slide", None) is not None:
         sim.SLIDE = bool(args.slide)
     sim.SLIDE_UP = float(getattr(args, "slide_up", 1.0))
+    if getattr(args, "f_push", None) is not None:
+        sim.F_PUSH = float(args.f_push)
+    if getattr(args, "press", None) is not None:
+        for _cls in SCRIPTS.values():
+            if hasattr(_cls, "PRESS"):
+                _cls.PRESS = float(args.press)
     viewer = None if args.headless else sim.u.render_human()
 
     auto_ax = () if args.auto_axes == ["none"] else tuple(AXIS_OF[a] for a in args.auto_axes)

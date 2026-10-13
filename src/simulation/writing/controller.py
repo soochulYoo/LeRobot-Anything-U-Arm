@@ -220,6 +220,12 @@ class Case1Proposal:
     Ur: float | Array | None = None   # rotational stiffness rate, Nm/rad/s;
                                   # scalar (isotropic) or 3-vector / 3x3, body
     u_tau: Array | None = None    # active joint torque proposal, N m
+    # THE LEAN CLAMP, in newtons: a ceiling on the spring force the operator may ask
+    # for.  None leaves the proposal exactly as it was.  `stiffness_helper.slave` has
+    # the same field for the same reason -- a person on a VR handle commands MOTION,
+    # and the force is whatever the spring makes of it, so a force limit has to be
+    # written as a limit on how far the reference may run from the tool.
+    f_push: float | None = None
 
 
 class Case1Controller:
@@ -340,6 +346,22 @@ class Case1Controller:
         # ---- 1. geometric error and potential gradient (world) ----
         p_de = p - self.x_d
         f_G = self.K @ p_de
+
+        # ---- 1b. the lean clamp: refuse to stretch the spring further -------------
+        # NOT a push back.  |f_G| is the spring force already carried, and d|f_G|/dt
+        # owes the proposal the term -f_hat . K Vd, so the force grows exactly when
+        # (K f_hat) . Vd < 0.  Removing that one component leaves a slide along the
+        # surface untouched and always leaves a RETREAT, which has the opposite sign.
+        # It releases itself: once the work gives way the tool advances, |f_G| falls
+        # under the ceiling, and nothing is subtracted.
+        if prop.f_push is not None:
+            nf = float(np.linalg.norm(f_G))
+            if nf >= float(prop.f_push) > 0.0:
+                g = self.K @ (f_G / nf)
+                ng = float(np.linalg.norm(g))
+                if ng > 1e-12:
+                    g = g / ng
+                    Vd_p = Vd_p - min(float(Vd_p @ g), 0.0) * g
 
         # ---- 2. active proposal: damping feed-forward ----
         # Case 1's baseline damps the ABSOLUTE velocity (tau_0 = -f_G - D V_s),
