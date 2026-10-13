@@ -584,16 +584,53 @@ class ContactConsole(WPR.Console):
 
 
 class _HandView:
-    """The simulator as `interactive.VRHand` sees it.  That hand takes `sim.W`'s third
-    column for the work's outward normal and pushes against it while the trigger is
-    held; here `W` follows the motion, so it is handed the hand's own frame instead."""
+    """The simulator as `interactive.VRHand` sees it.
+
+    That hand takes `sim.W`'s third column for the work's OUTWARD normal and pushes
+    along its negative while the trigger is held, so the third column is the whole of
+    the trigger's direction.  It used to be `HAND_AXES`, a frame fixed in the room, and
+    that is why the trigger could only press one way.
+
+    ON FLIP THAT IS THE TASK'S MAIN DIFFICULTY.  The box pivots against the wall, so
+    the direction worth pressing turns about 90 degrees from flat to upright, and the
+    successful scripted operator turns its push with it -- measured on 50 reference
+    episodes, its force sits 96 degrees off the tool axis at the start of the arc and
+    11 at the end.  A person on the handle cannot do that: they command MOTION, the
+    force is whatever the spring makes of it, and nothing tells them where to re-aim.
+    Measured on 92 VR episodes, the operator's push direction holds to 4.6 degrees
+    inside an episode -- they pick one direction and freeze -- while the scripted hand
+    moves 21.4.  Holding one direction through a turning contact wastes a growing
+    share of the push, and the operator compensates with force: failures peak at 21.6 N
+    across against the gate's 20, successes at 14.5.
+
+    So a task may now name the direction its trigger should push, and flip names the
+    box's own face.  `trigger_dir` is None everywhere else and the frame is the old
+    fixed one, so nothing but flip moves.
+    """
 
     def __init__(self, sim):
         self._sim = sim
 
     @property
     def W(self):
-        return self._sim.HAND_AXES
+        s = self._sim
+        d = getattr(s, "trigger_dir", lambda: None)()
+        if d is None:
+            return s.HAND_AXES
+        # the hand pushes along -W[:, 2], so the outward normal is the way NOT to go
+        n = -np.asarray(d, float)
+        nn = float(np.linalg.norm(n))
+        if nn < 1e-9:
+            return s.HAND_AXES
+        n = n / nn
+        a = np.asarray(s.HAND_AXES, float)
+        # keep as much of the room frame as the new third column allows, so the other
+        # two axes do not spin about it between steps
+        u = a[:, 0] - (a[:, 0] @ n) * n
+        if float(np.linalg.norm(u)) < 1e-6:
+            u = a[:, 1] - (a[:, 1] @ n) * n
+        u = u / max(float(np.linalg.norm(u)), 1e-9)
+        return np.column_stack([u, np.cross(n, u), n])
 
     def __getattr__(self, name):
         return getattr(self._sim, name)
@@ -616,6 +653,12 @@ def run_episode(sim, spec, user, levels, args, recorder=None, viewer=None,
             # is FORWARD, the stick's push, which on a drawer is into the chest.  A hand
             # squeezing the trigger to hold the handle pushed against its own pull.
             vr.map.p.press_force = 0.0
+        elif getattr(sim, "PRESS_FORCE", None) is not None:
+            # A task whose press has to reach further than the board's.  flip needs
+            # 8-19 N across to tip the box -- its successful VR episodes peak at 14.5 N
+            # and none above 18.6 -- where the default 6 N is the top of the wiping
+            # band and cannot move it at all.
+            vr.map.p.press_force = float(sim.PRESS_FORCE)
     elif args.motion == "human":
         import interactive as I
         hand = (I.LatchedHand if args.keys == "latch" else I.KeyboardHuman)(

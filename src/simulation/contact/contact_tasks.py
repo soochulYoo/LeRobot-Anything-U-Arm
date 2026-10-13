@@ -507,6 +507,20 @@ class FlipSim(ContactSim):
         """Along the near end, the way it has to be carried: up, then over to the wall."""
         return self._box()[0][:, 2]
 
+    # The VR trigger's direction, which `protocol._HandView` turns into the third column
+    # of the frame the hand presses against.  It is the box's own face, so the press
+    # follows the arc instead of staying where the room is -- the one thing a person on
+    # the handle cannot do for themselves, because they command motion and the force is
+    # whatever the spring makes of it.  LIVE rather than frozen at the lift: freezing is
+    # what makes the SCRIPTED hand's contact slide (`FlipScript._work_sliding`), and
+    # that is about where the tip travels; the trigger only adds force, and force wants
+    # to stay on the face it is pressing.
+    PRESS_FORCE = 20.0     # N at a full pull.  Successful VR episodes peak at 14.5 N
+                           # across and none above 18.6; the default 6 N cannot tip it.
+
+    def trigger_dir(self) -> Array:
+        return self.face_inward() if hasattr(self, "spec") else None
+
     def reset(self, spec: FlipSpec) -> dict:
         self.spec = spec
         self.env.reset(seed=spec.seed)
