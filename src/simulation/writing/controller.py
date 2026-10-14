@@ -333,6 +333,8 @@ class Case1Controller:
         pose = self.tcp.pose
         R = quat_wxyz_to_R(pose.q[0].cpu().numpy())
         p = pose.p[0].cpu().numpy().astype(float)
+        self._p = p            # `advance` needs it for the reach limit, and the pose
+                               # it would read there is one integration step stale
         J_b = self.pm.compute_single_link_local_jacobian(q, self.ee)   # body Jacobian at the tip
         V_b = J_b @ qd
         v = R @ V_b[:3]
@@ -454,11 +456,12 @@ class Case1Controller:
         # Self-releasing by construction: as the tool advances `p` follows and the
         # reference is free again, so nothing here can stop a task that is progressing.
         e_max = getattr(self, "e_max", None)
-        if e_max is not None:
-            d = self.x_d - p
+        pp = getattr(self, "_p", None)
+        if e_max is not None and pp is not None:
+            d = self.x_d - pp
             nd = float(np.linalg.norm(d))
             if nd > float(e_max) > 0.0:
-                self.x_d = p + d * (float(e_max) / nd)
+                self.x_d = pp + d * (float(e_max) / nd)
         if np.any(Krdot):
             # Eigenvalue projection, as for K.  This is where an UNREACHABLE
             # felt profile is refused: KR_from_felt can be indefinite, and the
