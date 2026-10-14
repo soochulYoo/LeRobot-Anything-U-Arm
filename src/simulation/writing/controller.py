@@ -357,11 +357,14 @@ class Case1Controller:
         if prop.f_push is not None:
             nf = float(np.linalg.norm(f_G))
             if nf >= float(prop.f_push) > 0.0:
-                g = self.K @ (f_G / nf)
-                ng = float(np.linalg.norm(g))
-                if ng > 1e-12:
-                    g = g / ng
-                    Vd_p = Vd_p - min(float(Vd_p @ g), 0.0) * g
+                # `grow`, not `g`: `g` is this method's gains object a few lines down,
+                # and shadowing it made the tank read `.tank` off an ndarray on the
+                # first episode that reached the ceiling.
+                grow = self.K @ (f_G / nf)
+                ngr = float(np.linalg.norm(grow))
+                if ngr > 1e-12:
+                    grow = grow / ngr
+                    Vd_p = Vd_p - min(float(Vd_p @ grow), 0.0) * grow
 
         # ---- 2. active proposal: damping feed-forward ----
         # Case 1's baseline damps the ABSOLUTE velocity (tau_0 = -f_G - D V_s),
@@ -435,6 +438,27 @@ class Case1Controller:
         """Integrate the applied reference, stiffness and tank to t + dt."""
         Vd, Kdot, Krdot, p_T, dt = self._pending
         self.x_d = self.x_d + Vd * dt
+
+        # ---- the reach limit: the reference may not run away from the tool ----------
+        # THE ONE FILTER THAT IS THE SAME FOR EVERY METHOD.  It is written in METRES
+        # and K does not appear, so a soft arm and a stiff arm are given exactly the
+        # same freedom to move and differ only in the force they make of it -- which is
+        # the difference the experiment exists to measure.  A force limit cannot do
+        # that: f = K e, so bounding f bounds e by f/K, and the stiffer the arm the
+        # earlier it is stopped.  `Case1Proposal.f_push` is such a limit and is kept
+        # only for the single-arm clamp it was written for; it must not be used in a
+        # comparison, and on the box it also stalled the task outright (92% of episodes
+        # hit the 30 s limit and peak across ROSE to 76 N, because a tool that cannot
+        # advance grinds against work that never gives).
+        #
+        # Self-releasing by construction: as the tool advances `p` follows and the
+        # reference is free again, so nothing here can stop a task that is progressing.
+        e_max = getattr(self, "e_max", None)
+        if e_max is not None:
+            d = self.x_d - p
+            nd = float(np.linalg.norm(d))
+            if nd > float(e_max) > 0.0:
+                self.x_d = p + d * (float(e_max) / nd)
         if np.any(Krdot):
             # Eigenvalue projection, as for K.  This is where an UNREACHABLE
             # felt profile is refused: KR_from_felt can be indefinite, and the

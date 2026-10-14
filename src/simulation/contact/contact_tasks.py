@@ -176,6 +176,8 @@ class ContactSim:
         # no-op there.
         g.tau_limit = np.concatenate([C.PANDA_TAU_LIMIT, np.zeros(self.nq - 7)])
         self.ctl = C.Case1Controller(self.robot, g, self.u.agent.urdf_path)
+        # the task's reach limit, applied to every method alike (controller.compute)
+        self.ctl.e_max = getattr(self, "E_MAX", None)
         self.qlim = self.robot.get_qlimits()[0].cpu().numpy()
         self._q_like = None        # the arm's configuration last time: the next start's seed
         links = self.robot.get_links()
@@ -515,6 +517,14 @@ class FlipSim(ContactSim):
     # what makes the SCRIPTED hand's contact slide (`FlipScript._work_sliding`), and
     # that is about where the tip travels; the trigger only adds force, and force wants
     # to stay on the face it is pressing.
+    # THE REACH LIMIT, in metres, the same for every method that runs this task.
+    # Set from what SUCCESS demonstrably needs and not from what separates arms: over
+    # the 2026-10-12 VR collection the successful episodes peak at 40.7 mm of
+    # |x_d - p| in contact (median 33.8), so 45 leaves every one of them untouched.
+    # Failures run to 58.9 mm, and the collection taken after the trigger began
+    # following the box sits at a median of 60.0 -- a reference that far ahead of the
+    # tool is the operator pushing at something that is not giving way.
+    E_MAX = 0.045
     PRESS_FORCE = 20.0     # N at a full pull.  Successful VR episodes peak at 14.5 N
                            # across and none above 18.6; the default 6 N cannot tip it.
 

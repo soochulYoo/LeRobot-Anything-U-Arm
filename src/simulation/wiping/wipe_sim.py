@@ -70,6 +70,12 @@ class WipingSim(SM.WritingSim):
 
     ENV_ID = "TeleopWiping-v1"
     TOOL_LINK = "eraser"
+    # THE REACH LIMIT, metres, the same for every method on this task.  Set from what
+    # SUCCESS needs: across both VR collections the successful episodes peak at 21.8 mm
+    # of |x_d - p| in contact, so 25 leaves every one untouched.  Failures in the older
+    # collection run to 58.6 mm, and a 25 mm limit would have caught 99% of them --
+    # which is the shape of the problem it is there for, not the reason for the number.
+    E_MAX = 0.025
 
     @staticmethod
     def tool_urdf() -> str:

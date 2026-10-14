@@ -175,6 +175,8 @@ class WritingSim:
         self.crit = criteria or Criteria()
         self.robot = self.u.agent.robot
         self.ctl = C.Case1Controller(self.robot, gains or C.Case1Gains(), self.tool_urdf())
+        # the task's reach limit, applied to every method alike (controller.compute)
+        self.ctl.e_max = getattr(self, "E_MAX", None)
         links = self.robot.get_links()
         self.pen = sapien_utils.get_obj_by_name(links, self.TOOL_LINK)
         self.others = [sapien_utils.get_obj_by_name(links, n)
