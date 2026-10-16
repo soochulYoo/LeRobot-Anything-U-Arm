@@ -200,6 +200,7 @@ class VRHand:
         self.sticks = StickLevels()
         self.done = False
         self.discard = False
+        self.takeover = False       # the off hand's grip, held: the model is off
         self._seen = -1.0
 
     def feed(self, msg) -> None:
@@ -236,6 +237,9 @@ class VRHand:
         drive = msg.get("hand")
         for hand, axes in sticks.items():
             self.sticks.feed("drive" if hand == drive else "off", axes)
+        # THE TAKEOVER BUTTON: the off hand's grip, held past half way
+        grips = msg.get("grips") or {}
+        self.takeover = any(float(v) > 0.5 for h, v in grips.items() if h != drive)
 
     def levels(self) -> list:
         """(axis, +1 stiffer / -1 softer) since the last call -- the same vocabulary

@@ -144,8 +144,23 @@ class HelperUser:
         self._dis_open = {i: False for i in self.axes}
         self._source = [self.TABLE] * 3
         self.events: list = []
+        self._grab, self._grab_new = False, False
 
     # ---- the interface run_episode uses --------------------------------------
+    def set_takeover(self, on: bool, t: float) -> None:
+        """THE TAKEOVER BUTTON (the VR off hand's grip, held): while it is held every axis
+        the model drives is the person's, whatever the model says.  An explicit grab, not
+        the stick's implicit one -- a stick push gives an axis back to the model three
+        seconds after the last push, and on the snap that was long enough for a model
+        softening early to take K_n back before the click.  The person's levels start at
+        what the robot has (`poll`), so taking over changes nothing until they move."""
+        on = bool(on)
+        if on != self._grab:
+            self._grab_new = on
+            for i in self.axes:
+                self._note(t, "takeover" if on else "release", i,
+                           human=None, model=int(self.helper.level[i]), phase="grip")
+        self._grab = on
     def reset(self) -> None:
         self.helper.reset()
         self._table.reset()
@@ -156,6 +171,7 @@ class HelperUser:
         self._dis_open = {i: False for i in self.axes}
         self._source = [self.TABLE] * 3
         self.events = []
+        self._grab, self._grab_new = False, False
 
     @property
     def level(self):
@@ -213,6 +229,11 @@ class HelperUser:
         self._table.poll(t, group)
         own = getattr(self._table, "own", None)          # the person's own keys
         auto = getattr(self._table, "auto", None)        # the protocol table
+        if self._grab_new and own is not None:
+            # the grab starts from what the robot HAS, so nothing jumps
+            for i in self.axes:
+                own.level[i] = int(self._level[i])
+        self._grab_new = False
         own_lvl = list(own.level) if own is not None else None
         new = list(self._table.level)
         # On the axes the model does not own the table's merge stands: the person's
@@ -222,6 +243,9 @@ class HelperUser:
 
         for i in self.axes:
             model = int(self.helper.level[i])
+            if self._grab and own_lvl is not None:
+                new[i], src[i] = own_lvl[i], self.PERSON     # held: the person's, outright
+                continue
             # (1) a PRESS on an axis the model owns: the person takes it, and the model's
             #     opinion at that instant is kept with it.
             if (own_lvl is not None and self._own_prev is not None

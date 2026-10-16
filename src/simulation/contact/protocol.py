@@ -85,6 +85,8 @@ sys.path.insert(0, str(HERE.parent / "writing"))
 import collect as CO  # noqa: E402  ../writing/collect.py, for the Recorder
 import contact_tasks as CT  # noqa: E402
 import teleop as T  # noqa: E402
+import wok_probe  # noqa: E402,F401  adds the wok to CT.SIMS: a VR trial, see its docstring
+import insert_tasks  # noqa: E402,F401  adds snap, plug and wallsnap: stiff -> soft
 
 
 def _wiping_protocol():
@@ -121,8 +123,11 @@ TABLES = {
     # it is not the operator), and 90 VR demos show the operator using LOW below 20
     # degrees of lift and MID above it -- never a dominant HIGH.  So `work` drops to
     # LOW and a `carry` row at MID takes over once the box is over.
-    "flip": {"approach": (MID, MID, MID), "pre-contact": (LOW, LOW, LOW),
-             "work": (LOW, LOW, LOW), "carry": (LOW, MID, LOW)},
+    # (across, along, K_R).  On the box: SOFT PRESS, FIRM TRAVEL -- across (the press
+    # into the face) LOW, along (the travel that carries it up) MID, from the first
+    # touch through the carry, as `stiffness_helper.labeler.TABLE_FLIP` teaches it.
+    "flip": {"approach": (MID, MID, MID), "pre-contact": (LOW, MID, LOW),
+             "work": (LOW, MID, LOW), "carry": (LOW, MID, LOW)},
     "door": {"approach": (HIGH, HIGH, HIGH), "pre-contact": (LOW, LOW, LOW),
              "work": (LOW, HIGH, LOW)},
     # THE DRAWER HAS A FOURTH ROW, and it is the reason the task exists.  The handle is
@@ -132,8 +137,40 @@ TABLES = {
     # cannot move.  No constant does both -- which flipping a box and opening a door
     # cannot show, because neither of them ends.
     "drawer": {"work": (LOW, HIGH, LOW), "stop": (LOW, LOW, LOW)},
+    # THE WOK HAS NO SCHEDULE YET.  It is a VR trial: the person sets the levels, and
+    # this one row exists so the collector runs.  Held from the first frame, it never
+    # leaves `work`.
+    "wok": {"work": (MID, MID, HIGH)},
+    # THE TWO INSERTIONS, one axis each (see insert_tasks.py).  SNAP: along HIGH to push
+    # the buckle through its click, LOW from the click on, where a stiff axis only
+    # presses on a latched part.  The other two are not this task's and sit MID: the
+    # wrist has to, because 40 N through a 12 mm ball tips the stick over any wrist
+    # softer than about 0.5 Nm/rad, and LOW is 0.3.
+    # (2026-10-16, the user's design) K_n STARTS MID and stays mid through the free
+    # motion; HIGH from just before the ball meets the buckle (pre-contact) through the
+    # push; LOW once latched.  Two changes, the first one ANTICIPATED: pushing at MID
+    # stalls at 20 N, so a late rise costs time to the click, not the click.
+    "snap": {"approach": (MID, MID, MID), "pre-contact": (MID, HIGH, MID),
+             "work": (MID, HIGH, MID), "stop": (MID, LOW, MID)},
+    # PLUG: across HIGH to hold the plug up against its cord while it is carried, LOW
+    # from the moment the blades enter, where a stiff axis fights the funnel sliding
+    # them into line.  Along and the wrist are not this task's and sit HIGH -- the
+    # wrist holds the plug level against the cord's moment.
+    "plug": {"approach": (HIGH, HIGH, HIGH), "pre-contact": (HIGH, HIGH, HIGH),
+             "work": (LOW, HIGH, HIGH), "stop": (LOW, HIGH, HIGH)},
+    # WALL SNAP (2026-10-16, the user's): the plug and the snap in one.  Across HIGH in
+    # free space, LOW from the blades' entry, as the plug's; along MID through the free
+    # motion, HIGH from just before the touch to the click, LOW once latched, as the
+    # snap's.  The wrist sits HIGH, as the plug's.
+    "wallsnap": {"approach": (HIGH, MID, HIGH), "pre-contact": (HIGH, HIGH, HIGH),
+                 "work": (LOW, HIGH, HIGH), "stop": (LOW, LOW, HIGH)},
 }
 EXPECTED = dict(TABLES["flip"])
+# where a scripted user's levels START.  MID everywhere, except on a task that says
+# `START_ON_TABLE` (`main` sets it then): the plug drops on its cord at anything below
+# HIGH across, and a MID start would fail it in the first reaction time -- and, replayed
+# by `--shift`, would make a late shift fail at the START and not at the event.
+START = [MID, MID, MID]
 AXIS_OF = {"t": 0, "n": 1, "r": 2}        # --auto-axes -> (across, along, K_R)
 AX = ("across", "along", "kr")
 WORKSPACE = 0.45    # m: a door's handle travels a quarter of a metre, and the hand leads it
@@ -150,7 +187,7 @@ class AutoUser:
         self.reset()
 
     def reset(self) -> None:
-        self.level = [MID, MID, MID]
+        self.level = list(START)
         self._group = None
         self._due = None
 
@@ -165,6 +202,51 @@ class AutoUser:
                 self.level = new
                 return True
         return False
+
+
+class RandomAxis:
+    """Another user with one axis switched to a RANDOM level at random times -- about
+    `rate` switches a second, exponential gaps -- whatever the user underneath wants.
+    Demos no table would produce: the schedule sweep's arbitrary stiffness."""
+
+    def __init__(self, inner, axis: int, rate: float, seed: int):
+        self.inner, self.axis, self.rate = inner, int(axis), float(rate)
+        self.rng = np.random.default_rng(77_000 + int(seed))
+        self.reset()
+
+    def reset(self) -> None:
+        self.inner.reset()
+        self.lv = int(self.rng.integers(0, 3))
+        self.next = float(self.rng.exponential(1.0 / self.rate))
+        self.level = self._mix()
+
+    def _mix(self) -> list:
+        lv = list(self.inner.level)
+        lv[self.axis] = self.lv
+        return lv
+
+    def poll(self, t: float, group: str) -> bool:
+        self.inner.poll(t, group)
+        if t >= self.next:
+            self.lv = int(self.rng.integers(0, 3))
+            self.next = t + float(self.rng.exponential(1.0 / self.rate))
+        new = self._mix()
+        changed = new != self.level
+        self.level = new
+        return changed
+
+    def __getattr__(self, k):
+        return getattr(self.__dict__["inner"], k)
+
+
+class StartLevels(WPR.KeyboardLevels):
+    """A person's own levels (the keys, or the VR sticks through `human_levels`),
+    starting each episode where a scripted user does: on the task's first table row
+    when it says `START_ON_TABLE`, MID otherwise.  The plug drops on its cord below
+    HIGH across, so a MID start had a person racing it in the first second."""
+
+    def reset(self) -> None:
+        self.level = list(START)
 
 
 class Compliance:
@@ -439,7 +521,57 @@ class DrawerScript(Script):
             self.state, self.t0 = "rest", t
 
 
-SCRIPTS = {"flip": FlipScript, "door": DoorScript, "drawer": DrawerScript}
+class SnapScript(Script):
+    """Come down on the buckle's top and push straight down; once it has clicked, hold.
+
+    It does not feel for the click and does not ease off after it: what being still
+    stiff on a latched part costs has to land in the force, as at the drawer's stop.
+    The task ends the episode once the hold after the click has been judged.
+    """
+    APPROACH = -CT.UP
+    # 60 N at full stretch: the click takes 30-40, and the force feedback is 1:1, so a
+    # hand that cannot out-push the prongs never finds out what the arm could do
+    K, REACH = 600.0, 0.10
+    V_WORK = 0.020                 # m/s
+
+    def _work(self, t: float, f_fb) -> None:
+        # pushing on to the end: the task ends the episode once its hold is judged
+        # (SnapSim.finished), and a hand that eased off would hide what it measures
+        self.tgt = self.tgt + self.V_WORK * self.sim.dt * self.APPROACH
+
+
+class PlugScript(Script):
+    """Carry the plug level to where the socket was said to be, and push it in along the
+    way it points, slowly; once it is home, hold.
+
+    A FIRM GRIP, as `PlugSim.VR_MAP` gives a person: through the script's default
+    300 N/m the hand gives way to the funnel by itself, and the cord's 5-7 N sags it
+    ~20 mm -- it arrived 21 mm low and hit the faceplate at every stiffness.  It does
+    NOT ease off sideways in the funnel: that is the stiffness's job, and what is
+    measured.
+    """
+    APPROACH = CT.FWD                         # forward, at the wall ahead
+    K, B, REACH = 10000.0, 140.0, 0.003       # 30 N at full stretch
+    V_WORK = 0.015                 # m/s: 20 mm of hole in a little over a second
+
+    def _work(self, t: float, f_fb) -> None:
+        # home: hold it there; the task ends the episode once its hold is judged
+        if not self.sim.seated():
+            self.tgt = self.tgt + self.V_WORK * self.sim.dt * self.APPROACH
+
+
+class WallSnapScript(PlugScript):
+    """The plug's hand, pushing on through the catch: in along the way it points,
+    slowly, and on to the end -- it does not feel for the click and does not ease off
+    after it, as the snap's does not.  60 N at full stretch: the click takes 30-40."""
+    REACH = 0.006
+
+    def _work(self, t: float, f_fb) -> None:
+        self.tgt = self.tgt + self.V_WORK * self.sim.dt * self.APPROACH
+
+
+SCRIPTS = {"flip": FlipScript, "door": DoorScript, "drawer": DrawerScript,
+           "snap": SnapScript, "plug": PlugScript, "wallsnap": WallSnapScript}
 
 
 class ContactHand:
@@ -476,6 +608,8 @@ class ContactHand:
             return False
         if s.WORK_ON == "dwell":
             return s.t - s.t_touch >= s.crit.land_window
+        if s.WORK_ON == "touch":       # the insertions: the push IS the work
+            return True
         return abs(float(s.n @ s.W0[:, 2])) < self.TURN
 
     def act(self, t: float, x_m, v_m, f_fb) -> np.ndarray:
@@ -486,10 +620,27 @@ class ContactHand:
         if self.phase == "work" and getattr(self.sim, "carrying", None) \
                 and self.sim.carrying():
             self.phase = "carry"
+        if self.phase == "work" and getattr(self.sim, "SEATS", False) \
+                and self.sim.seated():
+            # the insertions' event -- the click, the plug home -- is the `stop` row
+            self.phase = "seated"
         if self.grasped:
             # held, so `let_go` means nothing; the only move is onto the stop
             if self.phase == "work" and self.sim.seated():
                 self.phase = "seated"
+            return f_h
+        if getattr(self.sim, "WORK_ON", None) == "touch":
+            # THE INSERTIONS' PHASES ARE THEIR EVENTS, not the trigger.  The work is the
+            # contact and the stop is the click / the plug home; the trigger says only
+            # that the hand is coming in.  Read off the trigger, a plug pushed home by
+            # the controller alone -- which the firm grip allows -- never left `reach`,
+            # and the teacher, reading these phases, labelled the whole entry as carry.
+            if self.sim.seated():
+                self.phase = "seated"
+            elif self.sim.last["pen_down"]:
+                self.phase = "work"
+            else:
+                self.phase = "touch" if press else "reach"
             return f_h
         if self.phase == "reach":
             self._met = False
@@ -512,7 +663,7 @@ class ContactRecorder(CO.Recorder):
     stiffness triple is named along and across the motion, and a log of the triple
     without the frame it was in says nothing about which way the tool was stiff."""
     EXTRA_FULL = ("kr", "kr_req", "progress", "engaged", "across", "moment",
-                  "frame") + WPR.WHO
+                  "frame", "clamp", "reach", "reach_hit", "refused") + WPR.WHO
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -528,6 +679,11 @@ class ContactRecorder(CO.Recorder):
             self.full["kr_req"].append(np.float32(rec.get("kr_req", rec["kr"])))
             self.full["progress"].append(np.float32(rec["progress"]))
             self.full["engaged"].append(bool(rec["engaged"]))
+            self.full["clamp"].append(bool(rec.get("clamp", False)))
+            r = rec.get("reach")
+            self.full["reach"].append(np.float32(np.nan if r is None else r))
+            self.full["reach_hit"].append(bool(rec.get("reach_hit", False)))
+            self.full["refused"].append(np.float32(rec.get("refused", 0.0)))
             self.full["across"].append(np.float32(rec["across"]))
             self.full["moment"].append(np.float32(rec["moment"]))
             self.full["frame"].append(np.asarray(rec["W"], np.float32).reshape(9))
@@ -561,6 +717,12 @@ class ContactConsole(WPR.Console):
                   ladders=None, cams=[n for n, _ in self.CAMS],
                   note="the keyboard still works; the console is a second source")
 
+    def cue(self, name: str, t: float) -> None:
+        """An event the operator should FEEL now -- the snap's click, the plug's blades
+        in -- sent at once, not with the 2 Hz telemetry: the console buzzes the
+        controller and flashes it on the page."""
+        self.w.emit("cue", name=str(name), t=round(float(t), 3))
+
     def tel(self, sim, user, k_cmd, kr_cmd, rtf):
         """`k` is what the robot HAS, `k_req` what was asked -- see the wiping tap."""
         fn = float(sim.last["f_sensor_n"])
@@ -569,18 +731,19 @@ class ContactConsole(WPR.Console):
         alpha = float(sim.last.get("alpha", 1.0))
         self.frames += 1
         self.gated += int(alpha < self.GATE_SHUT)
+        # blind or not: the wiping tap's `_shown` decides what the screen may see
+        lvl, k, k_req, helper, who = self._shown(user, kd, sim.ctl.kr, k_cmd, kr_cmd)
         self.w.emit("tel", t=round(float(sim.t), 3),
                     f_n=round(float(sim.last["f_n"]), 3),
                     f_t=round(float(max(0.0, f * f - fn * fn) ** 0.5), 3),
-                    lvl=[int(v) for v in user.level],
-                    k=[float(kd[0]), float(kd[2]), float(sim.ctl.kr)],
-                    k_req=[float(k_cmd[0]), float(k_cmd[2]), float(kr_cmd)],
+                    lvl=lvl, k=k, k_req=k_req,
                     rtf=round(float(rtf), 2),
                     # what is still to do, in per cent of the way
                     left=int(round(100.0 * (1.0 - float(sim.last["progress"])))),
-                    down=bool(sim.last["pen_down"]), helper=self.helper_out(user),
-                    who=self.who(user), alpha=round(alpha, 3),
-                    gated=round(self.gated / max(1, self.frames), 4))
+                    down=bool(sim.last["pen_down"]), helper=helper,
+                    who=who, alpha=round(alpha, 3),
+                    gated=round(self.gated / max(1, self.frames), 4),
+                    **self.clamp_fields(sim), **self.reach_fields(sim))
 
 
 class _HandView:
@@ -659,6 +822,9 @@ def run_episode(sim, spec, user, levels, args, recorder=None, viewer=None,
             # and none above 18.6 -- where the default 6 N is the top of the wiping
             # band and cannot move it at all.
             vr.map.p.press_force = float(sim.PRESS_FORCE)
+        # a task that needs a different hand says so (the wok: fast enough to toss)
+        for k, v in getattr(sim, "VR_MAP", {}).items():
+            setattr(vr.map.p, k, v)
     elif args.motion == "human":
         import interactive as I
         hand = (I.LatchedHand if args.keys == "latch" else I.KeyboardHuman)(
@@ -669,11 +835,15 @@ def run_episode(sim, spec, user, levels, args, recorder=None, viewer=None,
     names = ("across", "along", "K_R")
 
     user.reset()
+    shown_prev = list(WPR.shown_user(user).level)
     comp = Compliance(args.grace)
     k_cmd = levels.k(user.level)
     kr_cmd = levels.k_r(user.level)
     dt = sim.dt
     i = 0
+    clamp_steps = 0                 # control steps the lean clamp held, this episode
+    reach_steps, reach_peak = 0, 0.0    # ... the reach limit cut, and the farthest asked
+    over, over_peak = 0.0, 0.0          # the hand's push past the reach limit, this stretch
     last_group = None
     last, acc = time.time(), 0.0
     t_wall0, t_sim0 = time.time(), sim.t
@@ -698,7 +868,13 @@ def run_episode(sim, spec, user, levels, args, recorder=None, viewer=None,
             for ax, sign in vr.levels():
                 if own is None:
                     break
-                own.level[ax] = int(np.clip(own.level[ax] + sign, 0, 2))
+                if ax in getattr(sim, "TWO_LEVEL", ()):
+                    # an axis whose MID is no use on this task: one push crosses it
+                    own.level[ax] = HIGH if sign > 0 else LOW
+                else:
+                    own.level[ax] = int(np.clip(own.level[ax] + sign, 0, 2))
+            if hasattr(user, "set_takeover"):
+                user.set_takeover(vr.takeover, sim.t)       # the off hand's grip
         if con is not None:
             cmd = con.poll()
             if cmd == "done":
@@ -718,28 +894,56 @@ def run_episode(sim, spec, user, levels, args, recorder=None, viewer=None,
             acc -= n_steps * dt
         for _ in range(n_steps):
             group = PHASE_GROUP[wr.phase]
-            if user.poll(sim.t, group) and viewer is not None:
+            changed = user.poll(sim.t, group)
+            if args.blind:
+                # the person's and the table's levels only, and a line only when THOSE
+                # change -- a helper's level changes would show as a stream of lines
+                now_lv = list(WPR.shown_user(user).level)
+                changed, shown_prev = now_lv != shown_prev, now_lv
+            else:
+                now_lv = user.level
+            if changed and viewer is not None:
                 print("\n    " + "  ".join(f"{n} {LEVEL_NAMES[v]}"
-                                           for n, v in zip(names, user.level)))
+                                           for n, v in zip(names, now_lv)))
             if group != last_group and viewer is not None:
                 print(f"\n  [{sim.t:5.1f}s] {group.upper():<12} -> " + ", ".join(
                     f"{n} {LEVEL_NAMES[v]}" for n, v in zip(names, EXPECTED[group])))
             last_group = group
             f_h = wr.act(sim.t, sess.x_m, sess.v_m, sess.f_fb)
             a_ramp = min(1.0, dt / args.ramp)
+            # SOFTEN FAST, STIFFEN SLOW, where a task asks (`RAMP_DOWN`): dropping
+            # stiffness only drains the arm's stored energy, so it can be quick; the snap's
+            # press on its latched part is judged a second after the click, and a 0.15 s
+            # ramp down ate half of a person's time to react
+            a_down = min(1.0, dt / float(getattr(sim, "RAMP_DOWN", None) or args.ramp))
             k_want, kr_want = WPR.stiffness(user, levels)
-            k_cmd = k_cmd + (k_want - k_cmd) * a_ramp
-            kr_cmd = kr_cmd + (kr_want - kr_cmd) * a_ramp
+            k_cmd = k_cmd + (k_want - k_cmd) * np.where(k_want < k_cmd, a_down, a_ramp)
+            kr_cmd = kr_cmd + (kr_want - kr_cmd) * (a_down if kr_want < kr_cmd else a_ramp)
             comp.step(sim.t, group, user.level)
             rec = sess.step(f_h, k_cmd, kr_cmd)
             rec.update(phase=PHASES.index(wr.phase), stroke=0,
-                       k_level=np.array(user.level), **WPR.opinions(user))
+                       k_level=np.array(user.level), **WPR.opinions(user),
+                       clamp=WPR.clamp_held(sim))
+            rec["reach"], rec["reach_hit"] = WPR.reach_now(sim)
+            clamp_steps += int(rec["clamp"])
+            reach_steps += int(rec["reach_hit"])
+            if rec["reach"] is not None:
+                reach_peak = max(reach_peak, float(rec["reach"]))
+            over = over + float(rec.get("refused", 0.0)) if rec["reach_hit"] else 0.0
+            over_peak = max(over_peak, over)
+            if con is not None:
+                con.saw(rec["clamp"], rec["reach"], rec["reach_hit"], rec.get("refused", 0.0))
+                cue = sim.cue()
+                if cue:
+                    con.cue(cue, sim.t)
             if hasattr(user, "observe"):
                 user.observe(sim.t, rec)
             if recorder is not None:
                 recorder.on_step(i, rec, sess, wr)
             i += 1
             if getattr(hand, "done", False):          # the script ends its own episode
+                wr.done = True
+            if sim.finished():                        # ... or the task ends it (insertions)
                 wr.done = True
             if wr.done:
                 break
@@ -763,6 +967,13 @@ def run_episode(sim, spec, user, levels, args, recorder=None, viewer=None,
         res["success"] = False
         res["fail_reason"] = ",".join(filter(None, [res["fail_reason"], "timeout"]))
     res["compliance"] = comp.summary()
+    res["clamp_s"] = (None if getattr(sim, "F_PUSH", None) is None
+                      else round(clamp_steps * float(sim.dt), 2))
+    e_max = getattr(sim.ctl, "e_max", None)
+    res["reach_s"] = round(reach_steps * float(sim.dt), 2)
+    res["reach_peak_mm"] = round(1e3 * reach_peak, 1)
+    res["reach_over_mm"] = round(1e3 * over_peak, 1)
+    res["e_max_mm"] = None if e_max is None else round(1e3 * float(e_max), 1)
     return res
 
 
@@ -783,7 +994,8 @@ def save_episode(sim, rec, res, spec, levels, args, seed: int, source: str,
             protocol=dict(levels=dataclasses.asdict(levels), expected=EXPECTED,
                           phase_group=PHASE_GROUP, ramp=args.ramp, grace=args.grace,
                           reaction=list(args.reaction), level_names=LEVEL_NAMES,
-                          axes=list(AX), auto_axes=list(args.auto_axes)),
+                          axes=list(AX), auto_axes=list(args.auto_axes),
+                          pin=WPR.pin_spec(args)),
             compliance=comp, operator=operator,
             master=dataclasses.asdict(T.MasterParams(workspace=WORKSPACE)),
             criteria=dataclasses.asdict(sim.crit),
@@ -802,7 +1014,14 @@ def save_episode(sim, rec, res, spec, levels, args, seed: int, source: str,
                erased=res["progress"], in_band=res["in_band"],
                peak_force=res["peak_force"], land_peak=res["land_peak"],
                peak_across=res["peak_across"], peak_moment=res["peak_moment"],
-               t=res["t"])
+               t=res["t"], f_push=getattr(sim, "F_PUSH", None),
+               clamp_s=res.get("clamp_s"), e_max_mm=res.get("e_max_mm"),
+               reach_s=res.get("reach_s"), reach_peak_mm=res.get("reach_peak_mm"),
+               reach_over_mm=res.get("reach_over_mm"),
+               # flip's own headline: did the box end standing, whatever else failed
+               upright=(res.get("checks") or {}).get("upright"),
+               # and any other task's own numbers, by its say (insert_tasks.py)
+               extra={k: res.get(k) for k in getattr(sim, "ROW_EXTRA", ())})
     return keep, path, row
 
 
@@ -815,6 +1034,9 @@ def verdict_line(row: dict, done: int, per_case: int) -> str:
             f"{row['land_peak']:.1f} N, across {row['peak_across']:.1f} N, wrist "
             f"{row['peak_moment']:.2f} Nm, {row['t']:.1f} s | protocol "
             + " ".join(f"{g} {100 * comp[g]:.0f}%" for g in GROUPS if comp[g] == comp[g])
+            + (f" | lean clamp held {row['clamp_s']:.1f} s"
+               if row.get("clamp_s") is not None else "")
+            + WPR.reach_note(row)
             + f" | {done}/{per_case}")
 
 
@@ -868,6 +1090,11 @@ def main() -> None:
                     metavar=("ACROSS", "ALONG", "KR"),
                     help="hold these three levels (0 low, 1 mid, 2 high) for the whole "
                          "episode: the MAGNITUDE check")
+    ap.add_argument("--blind", action="store_true",
+                    help="a blind session: print, show and send only the levels the "
+                         "person and the table set -- never a helper's, its output, or "
+                         "who set an axis -- so a session with a --helper looks exactly "
+                         "like one without.  The recording is unchanged")
     ap.add_argument("--pin", nargs="+", default=None, metavar="AXIS=LEVEL",
                     help="hold an axis at one level (0 low, 1 mid, 2 high) whatever the "
                          "table says, e.g. `--pin r=0`.  The unpinned axes keep "
@@ -912,6 +1139,16 @@ def main() -> None:
                          "5 N).  Raising it makes the script lean like a person does -- "
                          "the VR median is 22.8 N across against the script's 7.9 -- "
                          "which is how the clamp gets something to catch")
+    ap.add_argument("--schedule-n", default=None, metavar="S,C,L",
+                    help="K_n's level per phase in place of the table's: START (free "
+                         "motion), CONTACT (pre-contact and the push), LATCHED (the stop), "
+                         "each L / M / H -- e.g. M,H,L is the snap's own table.  For the "
+                         "schedule sweep that asks whether the labeler's choice is the one "
+                         "that works (scripts/snap_schedule_sweep.py)")
+    ap.add_argument("--random-n", type=float, default=None, metavar="RATE",
+                    help="K_n switched to a RANDOM level at random times, RATE switches a "
+                         "second on average, whatever the table says: demos no table would "
+                         "produce, for the same sweep")
     ap.add_argument("--time-limit", type=float, default=None,
                     help="override the spec's 30 s")
     ap.add_argument("--headless", action="store_true")
@@ -933,6 +1170,15 @@ def main() -> None:
 
     EXPECTED.clear()
     EXPECTED.update(TABLES[args.task])
+    if args.schedule_n:
+        lv = {"L": LOW, "M": MID, "H": HIGH}
+        st, co, la = (lv[x.strip().upper()] for x in args.schedule_n.split(","))
+        for g, v in (("approach", st), ("pre-contact", co), ("work", co), ("carry", co),
+                     ("stop", la)):
+            if g in EXPECTED:
+                row = list(EXPECTED[g])
+                row[1] = v
+                EXPECTED[g] = tuple(row)
     GROUPS[:] = [g for g in ("approach", "pre-contact", "work", "carry", "stop")
                  if g in EXPECTED]
     levels = WPR.Levels(xy=tuple(args.k_across), z=tuple(args.k_along), kr=tuple(args.k_r))
@@ -959,6 +1205,8 @@ def main() -> None:
     Sim, Spec = CT.SIMS[args.task]
     sim = Sim(cameras=not args.no_cameras, image_size=args.image_size,
               render_mode=None if args.headless else "human")
+    if getattr(sim, "START_ON_TABLE", False):
+        START[:] = list(EXPECTED[GROUPS[0]])
     # read by FlipScript._work; an attribute rather than a constructor argument so the
     # three sims keep one signature and the flag reaches only the hand that uses it
     sim.STEER = bool(getattr(args, "steer", False))
@@ -993,14 +1241,19 @@ def main() -> None:
         user = WPR.SplitLevels(
             ScriptedPerson(AutoUser(args.seed_base, tuple(args.reaction)),
                            args.person_rate, args.seed_base),
-            AutoUser(args.seed_base, tuple(args.reaction)), own_ax)
+            WPR.table_follower(args, args.seed_base, AutoUser), own_ax)
     elif args.auto_user or viewer is None:
         user = AutoUser(args.seed_base, tuple(args.reaction))
         if _pin:
             user = WPR.PinnedUser(user, _pin)
+        if args.random_n:
+            user = RandomAxis(user, 1, args.random_n, args.seed_base)
     else:
-        user = WPR.SplitLevels(WPR.KeyboardLevels(viewer.window),
-                               AutoUser(args.seed_base, tuple(args.reaction)), person_ax)
+        # THE PIN IS ON THE TABLE'S HALF (see WPR.table_follower): `--pin` used to be
+        # applied on the scripted path only, so in a person's session -- VR included --
+        # it was silently dropped and a "held" axis went on following the table.
+        user = WPR.SplitLevels(StartLevels(viewer.window),
+                               WPR.table_follower(args, args.seed_base, AutoUser), person_ax)
     if args.helper:
         import helper_user as HU
         # the envelope a helper's output expands into here, from where its training
@@ -1010,9 +1263,12 @@ def main() -> None:
         user = HU.HelperUser(sim, args.helper, levels, user, version=version,
                              axes=tuple(args.helper_axes), kspec=kspec,
                              output=args.helper_output)
-        print(f"  helper  {version} on {' '.join(args.helper_axes)}, "
-              f"{args.helper_output} output  ({args.helper})")
+        if not args.blind:   # a blind session never names its helper
+            print(f"  helper  {version} on {' '.join(args.helper_axes)}, "
+                  f"{args.helper_output} output  ({args.helper})")
     con = ContactConsole(sim) if args.console else None
+    if con is not None and args.blind:
+        con.blind_levels = levels
     source = {"script": "protocol-script", "human": "protocol-human",
               "vr": "protocol-vr"}[args.motion]
 
@@ -1072,10 +1328,11 @@ def main() -> None:
             attempt += 1
             log(row)
             if con is not None:
-                con.episode(dict(row, compliance=row["compliance"]["overall"],
-                                 gated=round(con.gated / max(1, con.frames), 4),
-                                 takeovers=(operator or {}).get("takeovers"),
-                                 disagreements=(operator or {}).get("disagreements")))
+                con.episode(con.episode_row(dict(
+                    row, compliance=row["compliance"]["overall"],
+                    gated=round(con.gated / max(1, con.frames), 4),
+                    takeovers=(operator or {}).get("takeovers"),
+                    disagreements=(operator or {}).get("disagreements"))))
             print("\n" + verdict_line(row, done, args.per_case))
     except KeyboardInterrupt:
         print("\n[quit] episode in progress discarded")

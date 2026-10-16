@@ -368,16 +368,125 @@ class Case1Controller:
                     grow = grow / ngr
                     Vd_p = Vd_p - min(float(Vd_p @ grow), 0.0) * grow
 
+        # ---- 1c. THE REACH LIMIT, on the proposal ----------------------------------
+        # The limit used to act only in `advance`, on the POSITION the reference
+        # reached; the damping feed-forward below is built from the velocity
+        # REQUESTED, so a reference held at E_MAX still pushed with D Vd -- and Vd is
+        # the operator's handle's speed.  A VR trigger is a force on a handle the
+        # grip lets go of at 12 N, so the handle ran off at 0.4 m/s and more, and with
+        # K_n at 300 N/m (6 N at the limit) the snap's buckle took 33 N and clicked:
+        # 24 of 50 demos (2026-10-14).  Here the step the reference may take is cut
+        # FIRST, against where the tool will be (p + v dt), and the feed-forward is
+        # built from what is left -- at the limit, the tool's own velocity.
+        #
+        # `e_rate` bounds how fast the reference may pull AWAY from the tool, m/s.
+        # The limit alone still let it reach E_MAX within tens of milliseconds, and
+        # the feed-forward of that motion punched the arm into the buckle at
+        # 0.36 m/s: K_n MID clicked 6/6 at 20 N of spring.  At 0.1 m/s MID clicked
+        # 0/6 and HIGH 6/6.  Only the distance to the tool is limited -- a reference
+        # the tool keeps up with moves as fast as the hand.
+        #
+        # `e_box` replaces the sphere with a box in `e_frame` (the task's fixed
+        # stiffness frame): per axis, so a load that holds one axis at its limit --
+        # the plug's cord, on the vertical -- does not take the others with it.  On
+        # the sphere the sag used up all of E_MAX and the plug could be moved neither
+        # in nor out, nor lifted.
+        #
+        # `f_safe` is a FORCE CEILING on top, N, per axis of `e_frame`: an axis may open
+        # its gap no further than f_safe / k on that axis, so no stiffness can press
+        # harder than f_safe however far the hand goes.  It binds only where the
+        # distance limit would allow more -- the stiff end of the ladder -- so the
+        # distance limit still tells the stiffnesses apart and this only makes the stiff
+        # one safe: on the snap, e_max(K) = min(20 mm, 45 N / K) is 6 / 20 / 45 N at
+        # LOW / MID / HIGH, against 6 / 20 / 60 N without it.  (The user's design,
+        # 2026-10-14: one force limit for every stiffness would let a soft arm reach the
+        # same force by going further, and the stiffness would stop mattering.)
+        e_max = getattr(self, "e_max", None)
+        e_rate = getattr(self, "e_rate", None)
+        e_box = getattr(self, "e_box", None)
+        f_safe = getattr(self, "f_safe", None)
+        self._reach = (None, False, None, None)
+        if (e_max is not None or e_rate is not None or e_box is not None
+                or f_safe is not None):
+            e0 = self.x_d - p
+            e1 = e0 + (Vd_p - v) * dt                   # the gap the request makes
+            n1 = float(np.linalg.norm(e1))
+            hit, lim_hit = False, None
+            Wf = np.asarray(getattr(self, "e_frame", np.eye(3)), float)
+            if e_box is not None:
+                loc = Wf.T @ e1
+                lim = np.asarray(e_box, float)
+                if np.any(np.abs(loc) > lim):
+                    cut = np.abs(loc) > lim
+                    lim_hit = float(np.min(lim[cut]))
+                    loc = np.clip(loc, -lim, lim)
+                    e1, hit = Wf @ loc, True
+            elif e_max is not None and n1 > float(e_max) > 0.0:
+                e1, hit, lim_hit = e1 * (float(e_max) / n1), True, float(e_max)
+            if f_safe is not None:
+                kf = np.maximum(np.diag(Wf.T @ self.K @ Wf), 1e-6)
+                lim_f = float(f_safe) / kf
+                loc = Wf.T @ e1
+                if np.any(np.abs(loc) > lim_f):
+                    cut = np.abs(loc) > lim_f
+                    lim_hit = float(np.min(lim_f[cut]))
+                    loc = np.clip(loc, -lim_f, lim_f)
+                    e1, hit = Wf @ loc, True
+            # what the LIMITS refused -- the part of the request a hand's map should
+            # forget (teleop's anti-windup) -- and only that: the rate limit below
+            # delays, it does not refuse
+            cut_vec = e1 - (e0 + (Vd_p - v) * dt)
+            if e_rate is not None:
+                # PER AXIS of the limit's frame, never along the gap: scaled along it, a
+                # push that met its limit shrank the plug's vertical sag with it, the
+                # anti-windup forgot the shrink, and the reference ratcheted down 6 mm
+                # in a second -- off the socket's funnel (2026-10-14)
+                loc0, loc1 = Wf.T @ e0, Wf.T @ e1
+                room = np.abs(loc0) + float(e_rate) * dt
+                over = np.abs(loc1) > room
+                if over.any():
+                    loc1[over] = np.sign(loc1[over]) * room[over]
+                    e1 = Wf @ loc1
+            Vd_p = v + (e1 - e0) / dt
+            self._reach = (n1, hit, lim_hit, cut_vec if hit else np.zeros(3))
+
         # ---- 2. active proposal: damping feed-forward ----
-        # Case 1's baseline damps the ABSOLUTE velocity (tau_0 = -f_G - D V_s),
-        # which makes a moving reference lag by D V_d / K -- 1.3 mm at a
-        # writing speed of 3 cm/s.  Damping the velocity RELATIVE to V_d
-        # removes the lag, but the extra term D V_d does work, and hiding it
-        # inside tau_0 would put an unaccounted energy source in the "passive"
-        # baseline.  It goes in the u slot instead, where the gate sees it.
+        # WHAT THE TOOL IS FOLLOWING, near the limit, on a task with `e_rate`.  The
+        # feed-forward exists so a MOVING reference is tracked without lag; a reference
+        # pulling away from a BLOCKED tool is not tracking anything, and fed forward its
+        # motion is a push of D times the operator's speed on top of the K e the limit
+        # bounds -- the snap's K_n MID (20 N at the limit) still clicked 6/6 with only
+        # `e_rate`.  So on each axis of the limit's frame, once the gap is past HALF its
+        # limit and still opening, that axis's feed-forward is the tool's own velocity:
+        # a blocked tool feels the spring and nothing else.  Per axis, not along the gap:
+        # the plug's gap points down as well as in (its cord's sag), and cutting along it
+        # pushed the plug down 6 mm, off the socket, every time the trigger pushed it in.
+        # Below half the limit nothing is cut, so a hand moving fast is still followed.
+        Vd_ff = Vd_p
+        if e_rate is not None and (e_box is not None or e_max is not None):
+            # ...and only where the tool is BLOCKED on that axis -- moving at under a
+            # fifth of the reference's speed along it.  By the gap alone it could not be
+            # placed: the plug's cord holds its vertical at 3-3.5 of 6 mm all the carry,
+            # so at half the limit every lift of the hand lost its feed-forward, and at
+            # three quarters the snap's MID push kept its own and clicked 5/6.  A pushed
+            # buckle barely moves; a lifted plug moves with its reference.
+            Wf = np.asarray(getattr(self, "e_frame", np.eye(3)), float)
+            lim = (np.asarray(e_box, float) if e_box is not None
+                   else np.full(3, float(e_max)))
+            if f_safe is not None:
+                lim = np.minimum(lim, float(f_safe)
+                                 / np.maximum(np.diag(Wf.T @ self.K @ Wf), 1e-6))
+            le = Wf.T @ ((self.x_d + Vd_p * dt) - p)
+            lr = Wf.T @ (Vd_p - v)
+            vl, vd = Wf.T @ v, Wf.T @ Vd_p
+            cut = ((np.abs(le) > 0.5 * lim) & (le * lr > 0.0)
+                   & (np.abs(vl) < 0.2 * np.abs(vd)))
+            if cut.any():
+                lr[cut] = 0.0
+                Vd_ff = v + Wf @ lr
         Lam = self.inertia(q, R, J_b)
         D = self.damping(self.K)
-        u_p = D @ Vd_p
+        u_p = D @ Vd_ff
 
         # ---- 3. proposal power at the CURRENT applied state ----
         # The rotational stiffness rate's share: d/dt of tr(K_R (I - R_d^T R))
@@ -457,11 +566,29 @@ class Case1Controller:
         # reference is free again, so nothing here can stop a task that is progressing.
         e_max = getattr(self, "e_max", None)
         pp = getattr(self, "_p", None)
-        if e_max is not None and pp is not None:
+        # WHAT THE LIMIT DID, kept for whoever is watching: `reach_req` is how far the
+        # reference was asked to be from the tool this step, before the limit, and
+        # `reach_hit` whether the limit cut it.  The applied distance is then
+        # min(reach_req, e_max), so the two say both how far the operator reached and
+        # how much of it was refused.  Read by the collectors; nothing here uses them.
+        # The cut is made in `compute`, on the proposal (see 1c there); this is what it
+        # reported, and the old cut on the position stays as the backstop, against a
+        # tool that moved otherwise than its velocity said.
+        req, hit, lim_hit, cut_vec = getattr(self, "_reach", (None, False, None, None))
+        self.reach_req, self.reach_hit = req, bool(hit)
+        # the part of the request the limits refused this step, m, world (None: not
+        # cut on the proposal) -- what a hand's map forgets (teleop)
+        self.reach_cut = cut_vec
+        # the limit that cut, m: E_MAX, a box side, or f_safe / k on the stiff axis
+        self.reach_lim = lim_hit
+        if pp is not None and getattr(self, "e_box", None) is None:
             d = self.x_d - pp
             nd = float(np.linalg.norm(d))
-            if nd > float(e_max) > 0.0:
+            if self.reach_req is None:
+                self.reach_req = nd
+            if e_max is not None and nd > 1.001 * float(e_max) > 0.0:
                 self.x_d = pp + d * (float(e_max) / nd)
+                self.reach_hit = True
         if np.any(Krdot):
             # Eigenvalue projection, as for K.  This is where an UNREACHABLE
             # felt profile is refused: KR_from_felt can be indefinite, and the

@@ -340,6 +340,65 @@ def pin_spec(args) -> dict:
             for a, v in (x.split("=") for x in getattr(args, "pin", None) or ())}
 
 
+# THE LEAN CLAMP, as the collectors see it.  The controller holds the spring force
+# |K (x - x_d)| at `sim.F_PUSH` by refusing the part of the reference's motion that would
+# stretch it further (`controller.Case1Proposal.f_push`, simulator commit 659529a).
+# `f_G` -- that spring force -- is in every step's record already, so whether the clamp
+# is HOLDING is read off it here and the controller is left exactly as it is: at or
+# over the ceiling, any further press is being refused.  CLAMP_AT is the share of the
+# ceiling that counts as at it, because a held force sits on the line, not above it.
+CLAMP_AT = 0.97
+
+
+def clamp_held(sim) -> bool:
+    """Is the lean clamp holding the spring force at its ceiling this step?"""
+    fp = getattr(sim, "F_PUSH", None)
+    if fp is None or not sim.last or "f_G" not in sim.last:
+        return False
+    return float(np.linalg.norm(sim.last["f_G"])) >= CLAMP_AT * float(fp)
+
+
+def clamp_supported() -> str:
+    """'' when this simulator's controller has the lean clamp, else why not."""
+    import inspect
+    have = "f_push" in {f.name for f in dataclasses.fields(T.C.Case1Proposal)}
+    passes = "F_PUSH" in inspect.getsource(T.TeleopSession)
+    if have and passes:
+        return ""
+    return ("this simulator's controller has no lean clamp (Case1Proposal.f_push and "
+            "teleop's F_PUSH arrived in commit 659529a): update the checkout first")
+
+
+# THE REACH LIMIT, as the collectors see it: `controller.Case1Controller.advance` keeps
+# how far the reference was ASKED to be from the tool this step (`reach_req`, metres,
+# before the limit) and whether the limit cut it (`reach_hit`).  The limit itself is
+# the task's `E_MAX`, the same for every method.  A controller older than the report
+# has neither, and then nothing is said rather than a limit that never engaged.
+def reach_now(sim) -> tuple:
+    """-> (asked distance in metres or None, whether the limit cut it) this step."""
+    ctl = sim.ctl
+    return getattr(ctl, "reach_req", None), bool(getattr(ctl, "reach_hit", False))
+
+
+def table_follower(args, seed: int, auto=None):
+    """The protocol table as the half of a SplitLevels nobody is at the keys for, with
+    any `--pin`ned axis held where it was pinned.
+
+    THE PIN HAS TO BE ON THE TABLE, NOT ON THE WHOLE USER, once a person or a helper is
+    in the loop.  Wrapping the whole user (as the scripted path does) would override a
+    stick push on a pinned axis -- right -- but also report the person's and the
+    table's opinions from underneath the pin, so the log would say the table chose a
+    level the robot never got.  Pinned here, the table's own opinion IS the pinned
+    level, and an axis a person or a helper owns is untouched by it.
+
+    `auto` is the task's own table-follower class, as for `shifted_user`: the stick
+    tasks have their own table.
+    """
+    table = (auto or AutoUser)(seed, tuple(args.reaction))
+    pin = pin_spec(args)
+    return PinnedUser(table, pin) if pin else table
+
+
 def shifted_user(run, seed: int, args, auto=None):
     """--shift S -> (user, operator record), after one reference pass.
 
@@ -460,7 +519,8 @@ class WipeRecorder(CO.Recorder):
     it, it sees the board.
     """
 
-    EXTRA_FULL = ("kr", "kr_req", "n_gone", "mis", "ask") + WHO
+    EXTRA_FULL = ("kr", "kr_req", "n_gone", "mis", "ask", "clamp", "reach",
+                  "reach_hit", "refused") + WHO
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -475,6 +535,11 @@ class WipeRecorder(CO.Recorder):
             self.full["kr"].append(np.float32(rec["kr"]))
             self.full["kr_req"].append(np.float32(rec.get("kr_req", rec["kr"])))
             self.full["n_gone"].append(np.int32(self.sim.gone.sum()))
+            self.full["clamp"].append(bool(rec.get("clamp", False)))
+            r = rec.get("reach")
+            self.full["reach"].append(np.float32(np.nan if r is None else r))
+            self.full["reach_hit"].append(bool(rec.get("reach_hit", False)))
+            self.full["refused"].append(np.float32(rec.get("refused", 0.0)))
             # How flush the pad lies, and what the board asked for under it.
             # Privileged (it needs the TRUE local normal) and recorded per step
             # rather than averaged, because the protocol holds K_R LOW only
@@ -588,11 +653,65 @@ class Console:
     # absence is an AttributeError in the middle of a control loop.
     frames = 0
     gated = 0
+    clamp_new = 0          # steps the clamp held since the last `tel`
+    clamp_steps = 0        # ... and in this episode
+    reach_new = 0          # steps the reach limit cut since the last `tel`
+    reach_steps = 0        # ... and in this episode
+    reach_peak = None      # the farthest the reference was asked to go since the last `tel`
+    over = 0.0             # how far the hand has pushed past the limit, this stretch at it
+    over_peak = 0.0        # ... the most of that since the last `tel`
 
     def new_episode(self) -> None:
         """Per EPISODE, not per session: a gated fraction that counts every frame since
         the process started says nothing about the demo just recorded."""
         self.frames = self.gated = 0
+        self.clamp_new = self.clamp_steps = 0
+        self.reach_new = self.reach_steps = 0
+        self.reach_peak = None
+        self.over = self.over_peak = 0.0
+
+    def saw(self, held: bool, reach=None, reach_hit: bool = False,
+            refused: float = 0.0) -> None:
+        """One control step: the force clamp's `clamp_held` and the reach limit's
+        `reach_now`, counted for the next `tel`.  `refused` is the hand motion the
+        limit dropped this step (teleop's anti-windup), summed over a stretch at it."""
+        self.clamp_new += int(held)
+        self.clamp_steps += int(held)
+        self.reach_new += int(reach_hit)
+        self.reach_steps += int(reach_hit)
+        self.over = self.over + float(refused) if reach_hit else 0.0
+        self.over_peak = max(self.over_peak, self.over)
+        if reach is not None:
+            self.reach_peak = reach if self.reach_peak is None else max(self.reach_peak, reach)
+
+    def reach_fields(self, sim) -> dict:
+        """`reach_mm` -- the farthest the reference was asked to be from the tool since
+        the last `tel`, before the limit -- `reach_max_mm` the limit (None: this task
+        has none), `reach_hit` whether it cut since the last `tel`, and `reach_s` how
+        long it has in this demo.  Nothing when the controller does not report."""
+        if self.reach_peak is None:
+            return {}
+        # the limit that actually cut, when the controller says (a box side, or the
+        # force ceiling's f_safe / k on a stiff axis); else the task's E_MAX
+        e_max = getattr(sim.ctl, "reach_lim", None) or getattr(sim.ctl, "e_max", None)
+        out = dict(reach_mm=round(1e3 * float(self.reach_peak), 1),
+                   reach_max_mm=None if e_max is None else round(1e3 * float(e_max), 1),
+                   reach_hit=self.reach_new > 0,
+                   reach_over_mm=round(1e3 * self.over_peak, 1),
+                   reach_s=round(self.reach_steps * float(sim.dt), 2))
+        self.reach_new, self.reach_peak, self.over_peak = 0, None, 0.0
+        return out
+
+    def clamp_fields(self, sim) -> dict:
+        """`clamp` -- it held at any step since the last `tel` -- and `clamp_s`, how
+        long it has in this demo.  Nothing at all when no clamp is set, so the page can
+        tell "off" from "on and never needed"."""
+        if getattr(sim, "F_PUSH", None) is None:
+            return {}
+        out = dict(clamp=self.clamp_new > 0,
+                   clamp_s=round(self.clamp_steps * float(sim.dt), 2))
+        self.clamp_new = 0
+        return out
 
     def tel(self, sim, user, k_cmd, kr_cmd, rtf):
         """What the screen shows is what the ROBOT HAS, not what it was asked for.
@@ -610,15 +729,35 @@ class Console:
         alpha = float(sim.last.get("alpha", 1.0))
         self.frames += 1
         self.gated += int(alpha < self.GATE_SHUT)
+        lvl, k, k_req, helper, who = self._shown(user, kd, sim.ctl.kr, k_cmd, kr_cmd)
         self.w.emit("tel", t=round(float(sim.t), 3),
                     f_n=round(float(sim.last["f_n"]), 3), f_t=round(ft, 3),
-                    lvl=[int(v) for v in user.level],
-                    k=[float(kd[0]), float(kd[2]), float(sim.ctl.kr)],
-                    k_req=[float(k_cmd[0]), float(k_cmd[2]), float(kr_cmd)],
+                    lvl=lvl, k=k, k_req=k_req,
                     rtf=round(float(rtf), 2), left=int((~sim.gone).sum()),
-                    down=bool(sim.last["pen_down"]), helper=self.helper_out(user),
-                    who=self.who(user), alpha=round(alpha, 3),
-                    gated=round(self.gated / max(1, self.frames), 4))
+                    down=bool(sim.last["pen_down"]), helper=helper,
+                    who=who, alpha=round(alpha, 3),
+                    gated=round(self.gated / max(1, self.frames), 4),
+                    **self.clamp_fields(sim), **self.reach_fields(sim))
+
+    # Set to the session's `Levels` by `--blind`; None shows the robot as it is.
+    blind_levels = None
+
+    def _shown(self, user, kd, kr, k_cmd, kr_cmd):
+        """(lvl, k, k_req, helper, who) for the screen.  Blind: the person's and the
+        table's levels and the stiffness THEY command, with no helper -- what a session
+        without one would send, whichever this is."""
+        if self.blind_levels is None:
+            return ([int(v) for v in user.level], [float(kd[0]), float(kd[2]), float(kr)],
+                    [float(k_cmd[0]), float(k_cmd[2]), float(kr_cmd)],
+                    self.helper_out(user), self.who(user))
+        shown = shown_user(user)
+        lv = [int(v) for v in shown.level]
+        kk, kkr = self.blind_levels.k(lv), self.blind_levels.k_r(lv)
+        k = [float(kk[0]), float(kk[2]), float(kkr)]
+        return lv, k, list(k), None, self.who(shown)
+
+    def episode_row(self, row: dict) -> dict:
+        return blind_row(row) if self.blind_levels is not None else row
 
     @staticmethod
     def who(user):
@@ -788,14 +927,14 @@ def make_table(args, viewer, person_ax):
         return None
     if viewer is None:
         return None
-    return SplitLevels(KeyboardLevels(viewer.window),
-                       AutoUser(args.seed_base, tuple(args.reaction)), person_ax)
+    return SplitLevels(KeyboardLevels(viewer.window), table_follower(args, args.seed_base),
+                       person_ax)
 
 
 def helper_table(args, seed: int):
-    """What a helper's non-owned axes follow: the protocol table, plus the person's own
-    keys when a person is there to press them."""
-    auto = AutoUser(seed, tuple(args.reaction))
+    """What a helper's non-owned axes follow: the protocol table (with its pins), plus
+    the person's own keys when a person is there to press them."""
+    auto = table_follower(args, seed)
     view = getattr(args, "_viewer", None)
     rate = getattr(args, "person_rate", None)
     if rate is not None:
@@ -819,6 +958,27 @@ def helper_table(args, seed: int):
         return auto
     person = getattr(args, "_person_ax", (0, 1, 2))
     return SplitLevels(KeyboardLevels(view.window), auto, person)
+
+
+# A BLIND SESSION shows a person only what they and the table set -- never a helper's
+# level, its output, whose level an axis has, or how often it was taken over -- so a
+# round with a student and a round without one cannot be told apart on any screen.
+# The recording is untouched: every demo still carries all of it.
+BLIND_HIDE = ("takeovers", "disagreements", "calls", "helper", "helper_output",
+              "helper_version", "operator")
+
+
+def shown_user(user):
+    """The levels a blind session shows: the person's and the table's merge that a
+    helper wraps -- exactly what the session would have had with no helper at all."""
+    if getattr(user, "helper", None) is not None and hasattr(user, "_table"):
+        return user._table
+    return user
+
+
+def blind_row(row: dict) -> dict:
+    """An episode row as a blind console may see it."""
+    return {k: v for k, v in row.items() if k not in BLIND_HIDE}
 
 
 def human_levels(user):
@@ -882,7 +1042,18 @@ def _spec_of(sim, args, seed: int):
     """The spec `seed` names, for the reference pass of --shift: `tiered` is handed the
     style and the seed but not the spec, and the seed is the whole of it."""
     case, attempt = divmod(seed - args.seed_base, 1000)
-    return episode_spec(args.texts[case], case, attempt, args.seed_base, args.letter)[0]
+    return _limited(episode_spec(args.texts[case], case, attempt, args.seed_base,
+                                 args.letter)[0], args)
+
+
+def _limited(spec, args):
+    """`--time-limit` applied, on EVERY path that builds a spec.  Only the single-process
+    loop did it: the `--workers` jobs and the `--shift` reference pass ran the spec's own
+    90 s whatever was asked, so a parallel evaluation and a console demo of the same
+    task were cut at different times."""
+    if getattr(args, "time_limit", None):
+        return dataclasses.replace(spec, time_limit=args.time_limit)
+    return spec
 
 
 def tiered(sim, style, seed: int, levels, args):
@@ -937,6 +1108,11 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
     """One episode with levels from `user`.  `hide` is the axes whose cue and read-out
     are suppressed, because the person does not own them this episode (see `Arms`)."""
     sim.reset(spec)
+    # the lean clamp's ceiling, per episode: a worker process builds its own sim
+    sim.F_PUSH = getattr(args, "f_push", None)
+    clamp_steps = 0
+    reach_steps, reach_peak = 0, 0.0
+    over, over_peak = 0.0, 0.0      # the hand's push past the reach limit, this stretch
     sess = T.TeleopSession(sim)
     # --motion human puts a PERSON where the synthetic wiper was.  writing/protocol.py's
     # KeyboardWriter drops in unchanged: WipingSim subclasses WritingSim, so it has the
@@ -969,6 +1145,7 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
         return "  ".join(f"{names[i]} {LEVEL_NAMES[lv[i]]:<{w}}" for i in shown)
 
     user.reset()
+    shown_prev = list(shown_user(user).level)
     comp = Compliance(args.grace)
     k_cmd = levels.k(user.level)
     kr_cmd = levels.k_r(user.level)
@@ -1043,8 +1220,16 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
             acc -= n_steps * dt
         for _ in range(n_steps):
             group = WP.group_of(wr)
-            if user.poll(sim.t, group) and viewer is not None and shown:
-                print(f"\n    {lv_str(user.level)}")
+            changed = user.poll(sim.t, group)
+            if getattr(args, "blind", False):
+                # the person's and the table's levels only, and a line only when THOSE
+                # change -- a helper's level changes would show as a stream of lines
+                now_lv = list(shown_user(user).level)
+                changed, shown_prev = now_lv != shown_prev, now_lv
+            else:
+                now_lv = user.level
+            if changed and viewer is not None and shown:
+                print(f"\n    {lv_str(now_lv)}")
             if cues and group != last_group:
                 want = EXPECTED[group]
                 cue = ", ".join(f"{names[i]} {LEVEL_NAMES[want[i]]}" for i in shown)
@@ -1060,7 +1245,17 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
             comp.step(sim.t, group, user.level)
             rec = sess.step(f_h, k_cmd, kr_cmd)
             rec.update(phase=T.PHASES.index(wr.phase), stroke=wr.k,
-                       k_level=np.array(user.level), **opinions(user))
+                       k_level=np.array(user.level), **opinions(user),
+                       clamp=clamp_held(sim))
+            rec["reach"], rec["reach_hit"] = reach_now(sim)
+            clamp_steps += int(rec["clamp"])
+            reach_steps += int(rec["reach_hit"])
+            if rec["reach"] is not None:
+                reach_peak = max(reach_peak, float(rec["reach"]))
+            over = over + float(rec.get("refused", 0.0)) if rec["reach_hit"] else 0.0
+            over_peak = max(over_peak, over)
+            if con is not None:
+                con.saw(rec["clamp"], rec["reach"], rec["reach_hit"], rec.get("refused", 0.0))
             # A helper sees EXACTLY what the recorder logs -- the same `rec` -- so what it
             # is given at run time cannot drift from what it was trained on.  Anything
             # else is a `user` and ignores this.
@@ -1082,7 +1277,8 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
             # and no camera while the demos themselves recorded perfectly.  The page
             # carries all of it anyway, so with a console there is nothing to print.
             if viewer is not None and con is None:
-                print(f"\r   t {sim.t:5.1f}s  {lv_str(user.level)}"
+                print(f"\r   t {sim.t:5.1f}s  "
+                      f"{lv_str(shown_user(user).level if getattr(args, 'blind', False) else user.level)}"
                       f"  board {sim.last['f_n']:4.1f} N  left {(~sim.gone).sum():3d}"
                       f"  {rtf:4.2f}x{' LAGGING' if rtf < 0.9 else '        '}",
                       end="", flush=True)
@@ -1108,6 +1304,13 @@ def run_episode(sim, spec, style, user, levels: Levels, args, recorder=None,
         res["success"] = False
         res["fail_reason"] = ",".join(filter(None, [res["fail_reason"], "timeout"]))
     res["compliance"] = comp.summary()
+    res["clamp_s"] = (None if getattr(sim, "F_PUSH", None) is None
+                      else round(clamp_steps * float(sim.dt), 2))
+    e_max = getattr(sim.ctl, "e_max", None)
+    res["reach_s"] = round(reach_steps * float(sim.dt), 2)
+    res["reach_peak_mm"] = round(1e3 * reach_peak, 1)
+    res["reach_over_mm"] = round(1e3 * over_peak, 1)
+    res["e_max_mm"] = None if e_max is None else round(1e3 * float(e_max), 1)
     return res
 
 
@@ -1129,7 +1332,7 @@ def save_episode(sim, rec, res, spec, style, levels, args, text: str, c: int, se
                           phase_group=PHASE_GROUP, dwell=args.dwell, ramp=args.ramp,
                           grace=args.grace, v_desc=args.v_desc, v_travel=args.v_travel,
                           reaction=list(args.reaction), level_names=LEVEL_NAMES,
-                          axes=["xy", "z", "kr"]),
+                          axes=["xy", "z", "kr"], pin=pin_spec(args)),
             compliance=comp, operator=operator,
             master=dataclasses.asdict(T.MasterParams()),
             criteria=dataclasses.asdict(sim.crit),
@@ -1150,7 +1353,11 @@ def save_episode(sim, rec, res, spec, style, levels, args, text: str, c: int, se
                kept=bool(path), scored=bool(keep),
                saved=str(path) if path else None, success=bool(res["success"]),
                reason=reason, compliance=comp, erased=res["erased"],
-               in_band=res["in_band"], peak_force=res["peak_force"], t=res["t"])
+               in_band=res["in_band"], peak_force=res["peak_force"], t=res["t"],
+               f_push=getattr(args, "f_push", None), clamp_s=res.get("clamp_s"),
+               e_max_mm=res.get("e_max_mm"), reach_s=res.get("reach_s"),
+               reach_peak_mm=res.get("reach_peak_mm"),
+               reach_over_mm=res.get("reach_over_mm"))
     return keep, path, row
 
 
@@ -1162,7 +1369,18 @@ def verdict_line(row: dict, done: int, per_case: int) -> str:
     return (f"[{v}] erased {row['erased']:.2f} in-band {row['in_band']:.2f} "
             f"peak {row['peak_force']:.1f} N | protocol "
             + " ".join(f"{g} {100 * comp[g]:.0f}%" for g in GROUPS if comp[g] == comp[g])
+            + (f" | lean clamp held {row['clamp_s']:.1f} s" if row.get("clamp_s") is not None
+               else "")
+            + reach_note(row)
             + f" | {done}/{per_case}")
+
+
+def reach_note(row: dict) -> str:
+    """' | reach limit 25 mm: 1.2 s at it, pushed up to 40 mm past' -- or ''."""
+    if row.get("e_max_mm") is None:
+        return ""
+    return (f" | reach limit {row['e_max_mm']:.0f} mm: {row.get('reach_s') or 0:.1f} s at "
+            f"it, pushed up to {row.get('reach_over_mm') or 0:.0f} mm past")
 
 
 # --------------------------------------------------------------------------- #
@@ -1181,6 +1399,7 @@ def _run_job(job) -> dict:
     apply_protocol(args)                  # `spawn` re-imported this module
     levels = Levels(xy=tuple(args.k_xy), z=tuple(args.k_z), kr=tuple(args.k_r))
     spec, style, seed = episode_spec(text, c, attempt, args.seed_base, args.letter)
+    spec = _limited(spec, args)
     style, user, operator = tiered(_SIM, style, seed, levels, args)
     rec = WipeRecorder(_SIM, images=not args.no_cameras,
                        video_every=2 if attempt < args.video else 0)
@@ -1248,12 +1467,26 @@ def main() -> None:
     ap.add_argument("--shift-axes", nargs="+", default=None, choices=("t", "n", "r"),
                     help="with --shift: only these axes are moved; the rest switch on "
                          "time.  Default: all three")
+    ap.add_argument("--blind", action="store_true",
+                    help="a blind session: print, show and send only the levels the "
+                         "person and the table set -- never a helper's, its output, or "
+                         "who set an axis -- so a session with a --helper looks exactly "
+                         "like one without.  The recording is unchanged")
+    ap.add_argument("--f-push", type=float, default=None, metavar="N",
+                    help="THE LEAN CLAMP: a ceiling on the spring force the operator may "
+                         "ask for.  Past it the reference is refused the part of its "
+                         "motion that would press harder; sliding along the board and "
+                         "lifting off are untouched.  For the sustained over-press that "
+                         "fails the force band and tears the board -- not for a landing "
+                         "spike, which is arrival speed")
     ap.add_argument("--pin", nargs="+", default=None, metavar="AXIS=LEVEL",
                     help="hold an axis at one level (0 low, 1 mid, 2 high) whatever "
                          "the table says, e.g. `--pin r=0`.  Unlike --hold, which fixes "
                          "all three, the unpinned axes keep following the schedule -- "
                          "which is what a PER-AXIS ablation needs.  Combines with "
-                         "--shift as before")
+                         "--shift as before.  In a person's or a helper's session it "
+                         "pins the TABLE's half: an axis the person or the helper owns "
+                         "is theirs, so pin only axes in --auto-axes")
     ap.add_argument("--helper-output", choices=("level", "level5", "continuous"),
                     default="level",
                     help="what the robot is given on an axis the helper drives: its "
@@ -1317,6 +1550,12 @@ def main() -> None:
     ap.add_argument("--no-cameras", action="store_true")
     ap.add_argument("--image-size", type=int, default=128)
     args = ap.parse_args()
+    if args.f_push is not None:
+        why = clamp_supported()
+        if why:
+            ap.error(f"--f-push: {why}")
+        if args.f_push <= 0:
+            ap.error("--f-push is a force ceiling in newtons: give a positive number")
     if args.scripted or args.helper or args.hold is not None or args.shift is not None:
         args.auto_user = True        # the tier or the helper sets the levels, not a keyboard
     if sum(x is not None for x in (args.scripted, args.helper, args.hold, args.shift)) > 1:
@@ -1466,6 +1705,8 @@ def main() -> None:
     # The console is built AFTER the simulator, so a scene that fails to load is a plain
     # traceback on stderr and not a half-open pipe the console has to time out.
     con = Console(sim) if args.console else None
+    if con is not None and args.blind:
+        con.blind_levels = levels
     args._console = con
     args._viewer = viewer
 
@@ -1478,8 +1719,7 @@ def main() -> None:
             text = args.texts[c]
             spec, style, seed = episode_spec(text, c, attempt[c], args.seed_base,
                                              args.letter)
-            if args.time_limit:
-                spec = dataclasses.replace(spec, time_limit=args.time_limit)
+            spec = _limited(spec, args)
             operator = None
             if arms is not None:
                 arm = arms.next()
@@ -1585,10 +1825,11 @@ def main() -> None:
                 # and recover their labels in hindsight, so scoring them as discards is
                 # backwards, and it made the target unreachable while an operator was
                 # still learning.  Only PASS discards, and that path never gets here.
-                con.episode(dict(row, compliance=row["compliance"]["overall"],
-                                 gated=round(con.gated / max(1, con.frames), 4),
-                                 takeovers=(operator or {}).get("takeovers"),
-                                 disagreements=(operator or {}).get("disagreements")))
+                con.episode(con.episode_row(dict(
+                    row, compliance=row["compliance"]["overall"],
+                    gated=round(con.gated / max(1, con.frames), 4),
+                    takeovers=(operator or {}).get("takeovers"),
+                    disagreements=(operator or {}).get("disagreements"))))
             print("\n" + verdict_line(row, done[c], args.per_case))
     except KeyboardInterrupt:
         print("\n[quit] episode in progress discarded")

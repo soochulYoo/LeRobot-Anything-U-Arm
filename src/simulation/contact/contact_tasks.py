@@ -148,6 +148,13 @@ class ContactSim:
     # the tip happened to be going.  The first two are what a keyboard's I/J/K/L move
     # along.  Each task says its own.
     HAND_AXES = VR_AXES
+    # A TASK WITH ONE AXIS OF ITS OWN keeps the frame it started in: `along` is that axis
+    # for the whole episode, and the reference's own path does not turn it.  The
+    # insertions (insert_tasks.py) are pushed along a fixed axis and STALL on it -- at
+    # the prongs, in the hole -- and a stalled reference's direction is its noise:
+    # followed, `along` drifted 50 degrees off the push in a second, the stiff axis
+    # left the buckle and it came back out.
+    FIXED_FRAME = False
     TRAIL = 0.005          # m of the reference's own path its direction is taken over
     TRAIL_STEP = 0.001     # m between the points kept along it
     TRAIL_GONE = 0.5       # of TRAIL: the least it must have got, end to end, to count
@@ -176,8 +183,13 @@ class ContactSim:
         # no-op there.
         g.tau_limit = np.concatenate([C.PANDA_TAU_LIMIT, np.zeros(self.nq - 7)])
         self.ctl = C.Case1Controller(self.robot, g, self.u.agent.urdf_path)
-        # the task's reach limit, applied to every method alike (controller.compute)
+        # the task's reach limit, applied to every method alike (controller.compute):
+        # a sphere of E_MAX, or a box of E_BOX in the stiffness frame, and E_RATE on
+        # how fast the reference may pull away from the tool
         self.ctl.e_max = getattr(self, "E_MAX", None)
+        self.ctl.e_box = getattr(self, "E_BOX", None)
+        self.ctl.e_rate = getattr(self, "E_RATE", None)
+        self.ctl.f_safe = getattr(self, "F_SAFE", None)     # N, a ceiling for any stiffness
         self.qlim = self.robot.get_qlimits()[0].cpu().numpy()
         self._q_like = None        # the arm's configuration last time: the next start's seed
         links = self.robot.get_links()
@@ -203,6 +215,7 @@ class ContactSim:
         self.n = np.asarray(along, float) / np.linalg.norm(along)
         self.W0 = frame_along(self.n)
         self.W = self.W0.copy()
+        self.ctl.e_frame = self.W
         self._trail = collections.deque([p.copy()],
                                         maxlen=int(round(self.TRAIL / self.TRAIL_STEP)) + 1)
         self.ctl.reset_state(p, R, C.k_world(self.K0, self.W), q_rest=q, kr=self.START_KR)
@@ -283,6 +296,15 @@ class ContactSim:
         """The work is done: nothing after this is held against the stiffness."""
         return False
 
+    def cue(self) -> str | None:
+        """A name, once, at an event the operator should feel (the console buzzes)."""
+        return None
+
+    def finished(self) -> bool:
+        """The task ends the episode itself -- the insertions do, once the hold they
+        are judged on is over -- so a demo cannot stop before it is judged."""
+        return False
+
     def _task_fields(self) -> dict:
         """`progress` in [0, 1], and whatever else the task wants in every record."""
         return dict(progress=0.0)
@@ -297,13 +319,15 @@ class ContactSim:
         self.ctl.advance()
         # WHICH WAY THE HAND IS GOING, from where the reference has come: the frame the
         # NEXT stiffness request is named in.
-        if np.linalg.norm(self.ctl.x_d - self._trail[-1]) >= self.TRAIL_STEP:
+        if (not self.FIXED_FRAME
+                and np.linalg.norm(self.ctl.x_d - self._trail[-1]) >= self.TRAIL_STEP):
             self._trail.append(self.ctl.x_d.copy())
             come = self._trail[-1] - self._trail[0]
             far = float(np.linalg.norm(come))
             if len(self._trail) == self._trail.maxlen and far >= self.TRAIL_GONE * self.TRAIL:
                 self.n = come / far
                 self.W = frame_along(self.n)
+                self.ctl.e_frame = self.W
         n = self.n
 
         f_raw = self._force(rec)

@@ -297,6 +297,31 @@ def main() -> int:
                      r["takeovers"] == 1 and r["disagreements"] == 1
                      and len(r["events"]) >= 2)
 
+    # ---- THE TAKEOVER BUTTON: the off hand's grip, held ---------------------------
+    # an explicit grab of every axis the model drives, for as long as it is held -- no
+    # three-second lease -- starting from the level the robot HAS, so nothing jumps
+    arb.poll(20.0, "contact")
+    bad += not check("before the grip the model drives", arb.level[2] == 0
+                     and arb.opinions()["k_source"][2] == arb.MODEL)
+    tab.own.level[2] = 2                          # a stale stick level from earlier
+    arb.set_takeover(True, 20.1)
+    arb.poll(20.1, "contact")
+    bad += not check("the grip takes the axis at the level the robot had",
+                     arb.level[2] == 0 and arb.opinions()["k_source"][2] == arb.PERSON,
+                     f"level {arb.level[2]}: a grab that jumped to an old stick level")
+    tab.own.level[2] = 2                          # then the person pushes HIGH
+    for t in (20.2, 25.0, 40.0):                  # held, long past the stick's lease
+        arb.poll(t, "contact")
+    bad += not check("  ... the person's sticks set it, for as long as it is held",
+                     arb.level[2] == 2 and arb.opinions()["k_source"][2] == arb.PERSON)
+    arb.set_takeover(False, 40.1)
+    arb.poll(40.1, "contact")
+    bad += not check("  ... and letting go gives it straight back to the model",
+                     arb.level[2] == 0 and arb.opinions()["k_source"][2] == arb.MODEL)
+    codes = [e["code"] for e in arb.events if e.get("phase") == "grip"]
+    bad += not check("  ... with the grab and the release in the record",
+                     codes == ["takeover", "release"], f"{codes}")
+
     # ---- the output applied as it is, not snapped --------------------------------
     # `--helper-output continuous`.  The rung is what every arm shares, so it stays the
     # default; this is the other thing a helper's number can be used for, and it only
@@ -527,7 +552,11 @@ def main() -> int:
         def poll(self, t, g):
             return False
 
-    ns_t = {"np": np, "MID": 1, "KeyboardLevels": _KL, "AutoUser": _KL}
+    ns_t = {"np": np, "MID": 1, "KeyboardLevels": _KL, "AutoUser": _KL,
+            "AXIS_NAMES": {"t": 0, "n": 1, "r": 2}}
+    exec(_grab("class PinnedUser:", "class RecordedLevels:"), ns_t)
+    exec(_grab("def pin_spec", "def table_follower"), ns_t)
+    exec(_grab("def table_follower", "def shifted_user"), ns_t)
     exec(_grab("class SplitLevels:", "def make_table"), ns_t)
     exec(_grab("def make_table", "def helper_table"), ns_t)
     exec(_grab("def helper_table", "_HELPERS: dict"), ns_t)
@@ -551,6 +580,24 @@ def main() -> int:
         _lands[_name] = ns_t["human_levels"](usr) is not None
     bad += not check("a person's stiffness has somewhere to go in every arrangement",
                      all(_lands.values()), str(_lands))
+
+    # ---- a pin holds the TABLE's half, and only that ---------------------------
+    # The console holds the axes a task is not about (`--pin t=0 n=0` on the curved
+    # board): the person keeps theirs, the table's are held, and the table's own
+    # opinion is the held level -- so the log does not say it chose a level the robot
+    # never got.
+    _pa = _Args("vr", False, (2,))
+    _pa.pin = ["t=0", "n=0"]
+    _pt = ns_t["make_table"](_pa, _pa._viewer, (2,))
+    _pt.reset()
+    _pt.own.level = [2, 2, 2]
+    _pt.poll(0.0, "approach")
+    _ph = ns_t["helper_table"](_pa, 0)
+    _ph.reset()
+    bad += not check("a pinned axis is held in a person's session, theirs is not",
+                     list(_pt.level) == [0, 0, 2] and list(_pt.auto.level) == [0, 0, 1]
+                     and list(_ph.level)[:2] == [0, 0],
+                     f"applied {list(_pt.level)}, the table's opinion {list(_pt.auto.level)}")
 
     # ---- and the write is read as a takeover, exactly like a keypress ----------
     class _Sp:

@@ -158,8 +158,49 @@ class TeleopSession:
                                f_push=getattr(sim, "F_PUSH", None))
         rec = sim.step(prop)
 
+        # ---- the lean clamp's ANTI-WINDUP: what it refused is forgotten -----------
+        # `Vd` above asks for the WHOLE gap to the master's mapped position every step,
+        # so a motion the clamp refuses is not dropped -- it is deferred, and grows: the
+        # reflected force is the clamped spring, so a hand that wants to press harder
+        # never meets resistance and keeps going.  The clamp removes only the component
+        # of that ever-growing request that would stretch the spring; everything else in
+        # it then drives the reference at up to `v_d_limit`.  Measured on flip with the
+        # scripted hand pressing to 35 N and a 19 N ceiling: the reference jumped 8.5 mm
+        # per 10 ms (0.6 mm unclamped) and the contact force peaked at 62 N, against
+        # 34 N with no clamp at all.  Re-anchoring the map on the steps the clamp holds
+        # makes a refused motion REFUSED: the reference stays where the clamp left it,
+        # sliding along and retreating still act at once, and nothing is replayed when
+        # the ceiling lets go.  Only on those steps -- the gate's and the velocity
+        # limit's own catch-up are left exactly as they were.
+        f_push = getattr(sim, "F_PUSH", None)
+        clamped = f_push is not None and float(np.linalg.norm(rec["f_G"])) >= float(f_push)
+        # ... and the same for THE REACH LIMIT, which needs it more.  The limit puts the
+        # reference back on a sphere of E_MAX round the tool, toward wherever the hand's
+        # map now points; with the refused motion kept, that point runs away (0.8 m in
+        # one VR demo) and every step re-asks for it, so the reference rides E_MAX ahead
+        # of the tool in the hand's direction however the tool moves.  That is a
+        # constant pull at a target that never gets nearer, and with a stiff damping
+        # feed-forward behind it the arm accelerated into the board: 8-13 m/s at the
+        # tool, every joint at its 87 Nm limit, 374-1348 N of contact on a board whose
+        # press the limit was meant to hold near 7.5 N.  Forgotten instead, the limit
+        # holds the reference where it cut it, and a hand that pulls back is followed at
+        # once.
+        refused = 0.0
+        cut = getattr(sim.ctl, "reach_cut", None)
+        if getattr(sim.ctl, "reach_hit", False) and cut is not None and not clamped:
+            # ONLY WHAT THE LIMIT REFUSED (controller 1c reports it): the rest of the gap
+            # between request and reference is the rate limit's delay, and forgetting it
+            # too made the reference ratchet down under the plug's cord
+            refused = float(np.linalg.norm(cut))
+            self.x_d0 = self.x_d0 + np.asarray(cut, float)
+        elif clamped or getattr(sim.ctl, "reach_hit", False):
+            refused = float(np.linalg.norm(x_d_req - sim.ctl.x_d))
+            self.x_d0 = self.x_d0 + (sim.ctl.x_d - x_d_req)
+
         # ---- reflected force: the spring the slave is stretching ----
         self.f_fb = self.bwd.push_and_get(mp.kf * rec["f_G"] / mp.scale)
+        # `refused`: metres of the hand's motion a limit dropped this step (see above)
+        rec.update(refused=refused)
         rec.update(x_m=self.x_m.copy(), v_m=self.v_m.copy(), f_h=np.asarray(f_h, float).copy(),
                    f_fb=self.f_fb.copy(), x_d_req=x_d_req, k_req=self.K_cmd.copy(),
                    kr_req=sim.ctl.kr if self.kr_cmd is None else self.kr_cmd)
